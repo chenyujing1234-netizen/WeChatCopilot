@@ -1,7 +1,10 @@
+import html
+import json
 import os
 import re
 import shutil
 import stat
+import tempfile
 import threading
 import time
 import uuid
@@ -14,7 +17,19 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, SecretStr
 
-from ..chat_helpers import _resolve_account_dir
+from ..account_identity import resolve_account_self_username
+from ..chat_export_service import (
+    _iter_rows_for_conversation,
+    _load_export_contact_usernames,
+    _load_export_session_targets,
+    _load_message_backed_export_targets,
+)
+from ..chat_helpers import (
+    _load_contact_rows,
+    _pick_display_name,
+    _resolve_account_dir,
+    _should_keep_session,
+)
 from ..export_integrity import IntegrityZipWriter, write_zip_integrity_sidecars
 from ..native_core_export import (
     decode_export_content_key,
@@ -32,6 +47,7 @@ class AccountArchiveExportRequest(BaseModel):
     output_dir: Optional[str] = Field(None, description="Absolute output directory. Defaults to output/exports/{account}.")
     include_databases: bool = Field(True, description="Whether to include decrypted database files.")
     include_resources: bool = Field(True, description="Whether to include resource folders.")
+    include_structured: bool = Field(False, description="Whether to include structured JSON data exports (e.g. chat messages).")
     file_name: Optional[str] = Field(None, description="Optional zip file name, with or without .zip.")
     encrypt: bool = Field(False, description="Encrypt the completed archive as a WEC1 file.")
     content_key_base64: Optional[SecretStr] = Field(
@@ -67,6 +83,7 @@ class AccountArchiveExportJob:
     file_name: str = ""
     database_count: int = 0
     resource_file_count: int = 0
+    structured_file_count: int = 0
     total_bytes: int = 0
     processed_bytes: int = 0
     created_at: int = field(default_factory=lambda: int(time.time()))
@@ -88,6 +105,7 @@ class AccountArchiveExportJob:
             "fileName": self.file_name,
             "databaseCount": int(self.database_count or 0),
             "resourceFileCount": int(self.resource_file_count or 0),
+            "structuredFileCount": int(self.structured_file_count or 0),
             "totalBytes": int(self.total_bytes or 0),
             "processedBytes": int(self.processed_bytes or 0),
             "createdAt": int(self.created_at or 0),
@@ -327,6 +345,388 @@ def _iter_selected_account_files(
             except OSError:
                 continue
 
+_STRUCTURED_CHAT_TYPE_NAMES = {
+    1: "文本",
+    3: "图片",
+    34: "语音",
+    37: "好友申请",
+    42: "名片",
+    43: "视频",
+    47: "表情",
+    48: "位置",
+    49: "复合消息",
+    50: "通话",
+    51: "状态通知",
+    62: "小视频",
+    66: "微信红包",
+    10000: "系统消息",
+    10002: "撤回消息",
+}
+
+
+def _structured_type_name(local_type: int) -> str:
+    if local_type in _STRUCTURED_CHAT_TYPE_NAMES:
+        return _STRUCTURED_CHAT_TYPE_NAMES[local_type]
+    if 10000 <= local_type < 20000:
+        return "系统消息"
+    return "未知"
+
+
+def _structured_time_text(ts: int) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ts or 0)))
+    except (ValueError, OverflowError, OSError):
+        return ""
+
+
+# Matches real markup tags only; plain text like "1<2 and a>b" is left untouched.
+_TAG_RE = re.compile(r"<[a-zA-Z/!][^>]*>")
+_APPMSG_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.S | re.I)
+_FILENAME_INVALID_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+_TXT_TYPE_FALLBACK_LABELS = {
+    3: "[图片]",
+    34: "[语音]",
+    37: "[好友申请]",
+    42: "[名片]",
+    43: "[视频]",
+    47: "[表情]",
+    48: "[位置]",
+    49: "[消息]",
+    50: "[通话]",
+    51: "[状态通知]",
+    62: "[小视频]",
+    66: "[红包]",
+}
+
+
+def _structured_plain_text(local_type: int, raw_text: str) -> str:
+    """Readable plain text for the txt transcript: strips HTML/XML markup."""
+    text = str(raw_text or "")
+    if not _TAG_RE.search(text):
+        return text.strip()
+
+    plain = ""
+    if local_type == 49:
+        match = _APPMSG_TITLE_RE.search(text)
+        if match:
+            plain = match.group(1)
+    if not plain:
+        plain = _TAG_RE.sub(" ", text)
+    plain = html.unescape(plain)
+    plain = re.sub(r"\s+", " ", plain).strip()
+    if not plain:
+        plain = _TXT_TYPE_FALLBACK_LABELS.get(local_type, "[消息]")
+    return plain
+
+
+def _structured_display_file_stem(display_name: str, username: str, used_names: set[str]) -> str:
+    """Filesystem-safe, case-insensitively unique file stem from a conversation name."""
+    stem = _FILENAME_INVALID_RE.sub("_", str(display_name or "").strip()).strip(" .")
+    if not stem:
+        stem = _FILENAME_INVALID_RE.sub("_", str(username or "").strip()).strip(" .")
+    if not stem:
+        stem = "未命名会话"
+    stem = stem[:60]
+    candidate = stem
+    counter = 2
+    while candidate.lower() in used_names:
+        candidate = f"{stem}_{counter}"
+        counter += 1
+    used_names.add(candidate.lower())
+    return candidate
+
+
+def _load_structured_display_names(account_dir: Path) -> dict[str, str]:
+    """One-shot username -> display name map from contact.db (contact + stranger)."""
+    contact_db_path = account_dir / "contact.db"
+    usernames = _load_export_contact_usernames(contact_db_path.parent)
+    rows = _load_contact_rows(contact_db_path, list(usernames))
+    out: dict[str, str] = {}
+    for username, row in rows.items():
+        out[username] = _pick_display_name(row, username)
+    return out
+
+
+def _resolve_structured_conversation_targets(account_dir: Path, self_username: str) -> list[tuple[str, int]]:
+    """Union of session.db conversations and conversations found in message databases."""
+    targets: dict[str, int] = {}
+
+    sessions, _hidden = _load_export_session_targets(account_dir)
+    for username, sort_ts in sessions:
+        u = str(username or "").strip()
+        if not u or u == self_username:
+            continue
+        if not _should_keep_session(u, include_official=False):
+            continue
+        targets[u] = max(int(sort_ts or 0), int(targets.get(u, 0)))
+
+    try:
+        backed = _load_message_backed_export_targets(account_dir=account_dir, seed_usernames=set(targets.keys()))
+    except Exception:
+        backed = {}
+    for username, latest_ts in backed.items():
+        u = str(username or "").strip()
+        if not u or u == self_username:
+            continue
+        targets[u] = max(int(latest_ts or 0), int(targets.get(u, 0)))
+
+    return sorted(targets.items(), key=lambda kv: kv[1], reverse=True)
+
+
+def _flatten_text_for_line(text: str) -> str:
+    return (
+        str(text or "")
+        .replace("\r\n", "\\n")
+        .replace("\n", "\\n")
+        .replace("\r", "\\n")
+    )
+
+
+def _generate_structured_chat_data(
+    *,
+    job: AccountArchiveExportJob,
+    account_dir: Path,
+    staging_dir: Path,
+    account_prefix: str,
+) -> list[AccountArchiveFile]:
+    """Generate structured JSON chat data under staging_dir/structured_data.
+
+    Each conversation is written to structured_data/chat/<idx>_<username>.json with
+    per-message fields: sender, time, content, receiver, type, etc. A plain-text
+    transcript named after the conversation (<会话名>.txt, one line per message:
+    time + sender + plain-text content, no HTML/XML markup) is generated alongside
+    for quick human reading.
+    """
+    _update_job(
+        job.export_id,
+        message="Generating structured data...",
+        detail="Reading decrypted chat databases and writing JSON/TXT files.",
+    )
+
+    self_username = resolve_account_self_username(account_dir)
+    display_names = _load_structured_display_names(account_dir)
+    targets = _resolve_structured_conversation_targets(account_dir, self_username)
+    if not targets:
+        raise FileNotFoundError(
+            "No chat conversations found for structured export (are decrypted message databases available?)."
+        )
+
+    def display_name_of(username: str) -> str:
+        return display_names.get(username) or username
+
+    def checkpoint() -> None:
+        _check_cancel(job)
+
+    chat_dir = staging_dir / "structured_data" / "chat"
+    chat_dir.mkdir(parents=True, exist_ok=True)
+
+    index_conversations: list[dict[str, Any]] = []
+    generated: list[AccountArchiveFile] = []
+    total_messages = 0
+    self_display = display_name_of(self_username) if self_username else account_dir.name
+    used_txt_names: set[str] = set()
+
+    for idx, (conv_username, _sort_ts) in enumerate(targets, start=1):
+        _check_cancel(job)
+        is_group = conv_username.endswith("@chatroom")
+        conv_display = display_name_of(conv_username)
+        json_file_stem = f"{idx:04d}_{_safe_file_name(conv_username, f'chat_{idx}')}"
+        out_path = staging_dir / "structured_data" / "chat" / f"{json_file_stem}.json"
+        txt_stem = _structured_display_file_stem(conv_display, conv_username, used_txt_names)
+        out_txt_path = staging_dir / "structured_data" / "chat" / f"{txt_stem}.txt"
+
+        message_count = 0
+        try:
+            with open(out_path, "w", encoding="utf-8", newline="\n") as out, open(
+                out_txt_path, "w", encoding="utf-8", newline="\n"
+            ) as txt_out:
+                txt_out.write(f"会话: {conv_display} ({conv_username})\n")
+                txt_out.write(f"账号: {account_dir.name}\n")
+                txt_out.write(f"导出时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                txt_out.write("\n")
+
+                out.write("{\n")
+                out.write('  "schemaVersion": 1,\n')
+                out.write('  "kind": "wechat_structured_data",\n')
+                out.write('  "dataType": "chat_messages",\n')
+                out.write(f"  \"exportedAt\": {json.dumps(time.strftime('%Y-%m-%dT%H:%M:%S'), ensure_ascii=False)},\n")
+                out.write(f"  \"account\": {json.dumps(account_dir.name, ensure_ascii=False)},\n")
+                out.write(
+                    "  \"conversation\": "
+                    + json.dumps(
+                        {
+                            "username": conv_username,
+                            "displayName": conv_display,
+                            "isGroup": is_group,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + ",\n"
+                )
+                out.write('  "messages": [\n')
+
+                rows = _iter_rows_for_conversation(
+                    account_dir=account_dir,
+                    conv_username=conv_username,
+                    start_time=None,
+                    end_time=None,
+                    local_types=None,
+                    source="decrypted",
+                    checkpoint=checkpoint,
+                )
+                first = True
+                for row in rows:
+                    sender = str(row.sender_username or "").strip()
+                    if row.is_sent:
+                        sender = self_username
+                        receiver = conv_username if is_group else conv_username
+                    else:
+                        if not sender:
+                            sender = conv_username if is_group else conv_username
+                        receiver = conv_username if is_group else self_username
+                    sender_display = self_display if row.is_sent else display_name_of(sender)
+                    local_type = int(row.local_type or 0)
+
+                    item = {
+                        "sender": sender,
+                        "senderDisplayName": sender_display,
+                        "isSelf": bool(row.is_sent),
+                        "timestamp": int(row.create_time or 0),
+                        "time": _structured_time_text(row.create_time),
+                        "type": local_type,
+                        "typeName": _structured_type_name(local_type),
+                        "content": row.raw_text,
+                        "receiver": receiver,
+                        "conversation": conv_username,
+                        "messageId": int(row.server_id or 0),
+                        "localId": int(row.local_id or 0),
+                    }
+                    line = json.dumps(item, ensure_ascii=False, default=str)
+                    if first:
+                        out.write(f"    {line}")
+                        first = False
+                    else:
+                        out.write(f",\n    {line}")
+                    message_count += 1
+
+                    content_flat = _flatten_text_for_line(_structured_plain_text(local_type, row.raw_text))
+                    if sender_display and sender and sender_display != sender:
+                        sender_label = f"{sender_display}({sender})"
+                    else:
+                        sender_label = sender_display or sender or "未知"
+                    if 10000 <= local_type < 20000:
+                        txt_line = f"[{item['time']}] [系统] {content_flat}"
+                    else:
+                        txt_line = f"[{item['time']}] {sender_label}: {content_flat}"
+                    txt_out.write(txt_line + "\n")
+
+                out.write("\n  ]\n}\n")
+        except AccountArchiveCancelled:
+            try:
+                out_path.unlink(missing_ok=True)
+                out_txt_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        except Exception:
+            # A single broken conversation should not abort the whole export.
+            try:
+                out_path.unlink(missing_ok=True)
+                out_txt_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+
+        if message_count <= 0:
+            try:
+                out_path.unlink(missing_ok=True)
+                out_txt_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+
+        total_messages += message_count
+        index_conversations.append(
+            {
+                "username": conv_username,
+                "displayName": conv_display,
+                "isGroup": is_group,
+                "messageCount": message_count,
+                "file": f"chat/{json_file_stem}.json",
+                "fileTxt": f"chat/{txt_stem}.txt",
+            }
+        )
+        for out_file, rel_name in (
+            (out_path, f"chat/{json_file_stem}.json"),
+            (out_txt_path, f"chat/{txt_stem}.txt"),
+        ):
+            try:
+                stat_result = out_file.stat()
+                generated.append(
+                    AccountArchiveFile(
+                        path=out_file,
+                        arcname=f"{account_prefix}/structured_data/{rel_name}",
+                        kind="structured",
+                        size=int(stat_result.st_size),
+                        mtime=float(stat_result.st_mtime),
+                        mode=int(stat_result.st_mode),
+                    )
+                )
+            except OSError:
+                continue
+
+    index_payload = {
+        "schemaVersion": 1,
+        "kind": "wechat_structured_data",
+        "exportedAt": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "account": account_dir.name,
+        "selfUsername": self_username,
+        "selfDisplayName": self_display,
+        "dataTypes": {
+            "chatMessages": {
+                "conversationCount": len(index_conversations),
+                "messageCount": total_messages,
+                "fields": [
+                    "sender",
+                    "senderDisplayName",
+                    "isSelf",
+                    "timestamp",
+                    "time",
+                    "type",
+                    "typeName",
+                    "content",
+                    "receiver",
+                    "conversation",
+                    "messageId",
+                    "localId",
+                ],
+                "conversations": index_conversations,
+            }
+        },
+    }
+    index_path = staging_dir / "structured_data" / "index.json"
+    index_path.write_text(json.dumps(index_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        stat_result = index_path.stat()
+        generated.append(
+            AccountArchiveFile(
+                path=index_path,
+                arcname=f"{account_prefix}/structured_data/index.json",
+                kind="structured",
+                size=int(stat_result.st_size),
+                mtime=float(stat_result.st_mtime),
+                mode=int(stat_result.st_mode),
+            )
+        )
+    except OSError:
+        pass
+
+    if not generated:
+        raise FileNotFoundError("No chat messages could be exported as structured data.")
+    return generated
+
+
 def _run_account_archive_export(export_id: str, payload: dict[str, Any]) -> None:
     job = _update_job(export_id, status="running", progress=1, message="Preparing export...", detail="")
     if not job:
@@ -334,11 +734,13 @@ def _run_account_archive_export(export_id: str, payload: dict[str, Any]) -> None
 
     zip_path: Optional[Path] = None
     tmp_path: Optional[Path] = None
+    staging_ctx: Optional[tempfile.TemporaryDirectory] = None
 
     try:
         include_databases = bool(payload.get("include_databases"))
         include_resources = bool(payload.get("include_resources"))
-        if not include_databases and not include_resources:
+        include_structured = bool(payload.get("include_structured"))
+        if not include_databases and not include_resources and not include_structured:
             raise ValueError("Please select at least one export option.")
 
         _check_cancel(job)
@@ -350,8 +752,20 @@ def _run_account_archive_export(export_id: str, payload: dict[str, Any]) -> None
         output_dir = _resolve_output_dir(account_dir, payload.get("output_dir"))
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        account_prefix = _safe_file_name(account_name, "account")
+        structured_files: list[AccountArchiveFile] = []
+        if include_structured:
+            _check_cancel(job)
+            staging_ctx = tempfile.TemporaryDirectory(prefix="wechat_structured_export_")
+            structured_files = _generate_structured_chat_data(
+                job=job,
+                account_dir=account_dir,
+                staging_dir=Path(staging_ctx.name),
+                account_prefix=account_prefix,
+            )
+
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        fallback_name = f"wechat_archive_{_safe_file_name(account_name, 'account')}_{stamp}.zip"
+        fallback_name = f"wechat_archive_{account_prefix}_{stamp}.zip"
         zip_name = _normalize_zip_name(payload.get("file_name"), fallback_name)
         zip_path = (output_dir / zip_name).resolve()
         final_path = zip_path.with_name(zip_path.name + ".wec") if job.content_key is not None else zip_path
@@ -381,23 +795,30 @@ def _run_account_archive_export(export_id: str, payload: dict[str, Any]) -> None
             zip_path=zip_path,
             output_dir=output_dir,
         ))
+        selected_files.extend(structured_files)
         if not selected_files:
             raise FileNotFoundError("No exportable files found for this account.")
 
         planned_db_count = sum(1 for item in selected_files if item.kind == "database")
-        planned_resource_count = sum(1 for item in selected_files if item.kind != "database")
+        planned_structured_count = sum(1 for item in selected_files if item.kind == "structured")
+        planned_resource_count = sum(
+            1 for item in selected_files if item.kind not in ("database", "structured")
+        )
         total_files = len(selected_files)
         total_bytes = sum(max(0, int(item.size or 0)) for item in selected_files)
-        if include_databases and not include_resources and planned_db_count <= 0:
+        if include_databases and not include_resources and not include_structured and planned_db_count <= 0:
             raise FileNotFoundError("No database files found for this account.")
-        if include_resources and not include_databases and planned_resource_count <= 0:
+        if include_resources and not include_databases and not include_structured and planned_resource_count <= 0:
             raise FileNotFoundError("No resource files found for this account.")
+        if include_structured and planned_structured_count <= 0:
+            raise FileNotFoundError("No structured data could be generated for this account.")
 
         _update_job(
             export_id,
             progress=5,
             database_count=planned_db_count,
             resource_file_count=planned_resource_count,
+            structured_file_count=planned_structured_count,
             total_bytes=total_bytes,
             processed_bytes=0,
             message="Writing ZIP archive...",
@@ -406,6 +827,7 @@ def _run_account_archive_export(export_id: str, payload: dict[str, Any]) -> None
 
         db_count = 0
         resource_file_count = 0
+        structured_count = 0
         processed_bytes = 0
         processed = 0
         last_progress_at = time.monotonic()
@@ -424,6 +846,8 @@ def _run_account_archive_export(export_id: str, payload: dict[str, Any]) -> None
                     processed += 1
                     if item.kind == "database":
                         db_count += 1
+                    elif item.kind == "structured":
+                        structured_count += 1
                     else:
                         resource_file_count += 1
                     processed_bytes += added_size
@@ -440,6 +864,7 @@ def _run_account_archive_export(export_id: str, payload: dict[str, Any]) -> None
                         progress=progress,
                         database_count=db_count,
                         resource_file_count=resource_file_count,
+                        structured_file_count=structured_count,
                         total_bytes=total_bytes,
                         processed_bytes=processed_bytes,
                         message="Writing ZIP archive...",
@@ -464,14 +889,22 @@ def _run_account_archive_export(export_id: str, payload: dict[str, Any]) -> None
         else:
             shutil.move(str(tmp_path), str(final_path))
 
+        if structured_count > 0:
+            done_detail = (
+                f"Exported {db_count} database files, {resource_file_count} resource files "
+                f"and {structured_count} structured data files."
+            )
+        else:
+            done_detail = f"Exported {db_count} database files and {resource_file_count} resource files."
         _update_job(
             export_id,
             status="done",
             progress=100,
             message="Export completed.",
-            detail=f"Exported {db_count} database files and {resource_file_count} resource files.",
+            detail=done_detail,
             database_count=db_count,
             resource_file_count=resource_file_count,
+            structured_file_count=structured_count,
             total_bytes=total_bytes,
             processed_bytes=processed_bytes,
             zip_path=str(final_path),
@@ -494,13 +927,18 @@ def _run_account_archive_export(export_id: str, payload: dict[str, Any]) -> None
         _update_job(export_id, status="error", error=str(exc), message="Export failed.", detail="")
         record_product_event("export_failed")
     finally:
+        if staging_ctx is not None:
+            try:
+                staging_ctx.cleanup()
+            except Exception:
+                pass
         erase_export_content_key(job.content_key)
         job.content_key = None
 
 
 @router.post("/api/account/archive_export", summary="Create account archive export job")
 async def export_account_archive(req: AccountArchiveExportRequest):
-    if not req.include_databases and not req.include_resources:
+    if not req.include_databases and not req.include_resources and not req.include_structured:
         raise HTTPException(status_code=400, detail="Please select at least one export option.")
 
     try:
@@ -516,6 +954,7 @@ async def export_account_archive(req: AccountArchiveExportRequest):
         "output_dir": req.output_dir,
         "include_databases": bool(req.include_databases),
         "include_resources": bool(req.include_resources),
+        "include_structured": bool(req.include_structured),
         "file_name": req.file_name,
     }
     export_id = uuid.uuid4().hex

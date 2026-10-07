@@ -109,6 +109,26 @@
                   <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m4 10 4 4 8-8" /></svg>
                 </span>
               </label>
+
+              <label
+                class="app-export-choice"
+                :class="{ 'is-active': includeStructured }"
+              >
+                <input v-model="includeStructured" type="checkbox" class="sr-only" />
+                <span class="app-export-choice__icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M8 4c-2 0-3 1-3 3v2c0 1.5-.8 2.3-2 3 1.2.7 2 1.5 2 3v2c0 2 1 3 3 3" />
+                    <path d="M16 4c2 0 3 1 3 3v2c0 1.5.8 2.3 2 3-1.2.7-2 1.5-2 3v2c0 2-1 3-3 3" />
+                  </svg>
+                </span>
+                <span class="app-export-choice__copy">
+                  <strong>结构化的数据</strong>
+                  <p>将聊天记录导出为 JSON 与 TXT 文件，包含发送者、时间、内容、接收者等字段。</p>
+                </span>
+                <span class="app-export-radio-check" aria-hidden="true">
+                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m4 10 4 4 8-8" /></svg>
+                </span>
+              </label>
             </div>
           </section>
 
@@ -231,6 +251,7 @@ const exportFolder = ref('')
 const exportFolderHandle = ref(null)
 const includeDatabases = ref(true)
 const includeResources = ref(true)
+const includeStructured = ref(false)
 const task = ref(null)
 const currentExportId = ref('')
 const cancelRequested = ref(false)
@@ -250,13 +271,14 @@ const hasExportTarget = computed(() => {
     : !!exportFolderHandle.value
 })
 
-const hasSelectedContent = computed(() => !!includeDatabases.value || !!includeResources.value)
+const hasSelectedContent = computed(() => !!includeDatabases.value || !!includeResources.value || !!includeStructured.value)
 
 const contentSummary = computed(() => {
-  if (includeDatabases.value && includeResources.value) return '数据库 + 资源文件'
-  if (includeDatabases.value) return '仅数据库'
-  if (includeResources.value) return '仅资源文件'
-  return '未选择内容'
+  const selected = []
+  if (includeDatabases.value) selected.push('数据库')
+  if (includeResources.value) selected.push('资源文件')
+  if (includeStructured.value) selected.push('结构化数据')
+  return selected.length > 0 ? selected.join(' + ') : '未选择内容'
 })
 
 const canStartExport = computed(() => {
@@ -420,7 +442,7 @@ const validateSelections = () => {
   const errors = []
   if (!selectedAccount.value) errors.push('未选择账号。')
   if (!hasExportTarget.value) errors.push('请先选择导出目录。')
-  if (!hasSelectedContent.value) errors.push('请至少选择数据库或资源文件。')
+  if (!hasSelectedContent.value) errors.push('请至少选择一种导出内容。')
   return errors
 }
 
@@ -431,6 +453,12 @@ const translateArchiveMessage = (message) => {
     .replace('Waiting to start...', '等待开始...')
     .replace('Preparing export...', '正在准备导出...')
     .replace('Scanning export content...', '正在扫描导出内容...')
+    .replace('Generating structured data...', '正在生成结构化数据...')
+    .replace('Reading decrypted chat databases and writing JSON files.', '正在读取已解密的聊天数据库并生成 JSON 文件。')
+    .replace('Reading decrypted chat databases and writing JSON/TXT files.', '正在读取已解密的聊天数据库并生成 JSON/TXT 文件。')
+    .replace(/No chat conversations found for structured export[^.]*/, '未找到可导出的聊天会话（可能尚未完成数据库解密）。')
+    .replace('No chat messages could be exported as structured data.', '没有可导出为结构化数据的聊天消息。')
+    .replace('No structured data could be generated for this account.', '未能为该账号生成结构化数据。')
     .replace('Calculating total archive size.', '\u6b63\u5728\u8ba1\u7b97\u5f52\u6863\u603b\u5927\u5c0f\u3002')
     .replace('Preparing database and resource file list.', '正在准备数据库和资源文件列表。')
     .replace('Scanning resource files...', '正在扫描资源文件...')
@@ -446,6 +474,7 @@ const translateArchiveMessage = (message) => {
     .replace('Moving archive to target folder.', '正在移动归档到目标目录。')
     .replace('Export completed.', '导出完成。')
     .replace(/Exported (\d+) database files and (\d+) resource files\./, '已导出 $1 个数据库文件和 $2 个资源文件。')
+    .replace(/Exported (\d+) database files, (\d+) resource files and (\d+) structured data files\./, '已导出 $1 个数据库文件、$2 个资源文件和 $3 个结构化数据文件。')
     .replace('Cancelling export...', '正在取消导出...')
     .replace('Waiting for the current file operation to stop.', '正在等待当前文件写入停止。')
     .replace('Export cancelled.', '导出已取消。')
@@ -470,6 +499,7 @@ const normalizeArchiveJob = (job = {}) => {
     progress: Number(job.progress || 0),
     databaseCount: Number(job.databaseCount || 0),
     resourceFileCount: Number(job.resourceFileCount || 0),
+    structuredFileCount: Number(job.structuredFileCount || 0),
     totalBytes: Number(job.totalBytes || 0),
     processedBytes: Number(job.processedBytes || 0),
     fileName: String(job.fileName || '')
@@ -539,6 +569,7 @@ const startExport = async () => {
       output_dir: isDesktopExportRuntime() ? String(exportFolder.value || '').trim() : null,
       include_databases: !!includeDatabases.value,
       include_resources: !!includeResources.value,
+      include_structured: !!includeStructured.value,
       file_name: fileName
     })
 
@@ -559,7 +590,9 @@ const startExport = async () => {
     }
 
     const resultFileName = String(finalJob.fileName || fileName).trim()
-    task.value.detail = `打包完成：数据库 ${Number(finalJob.databaseCount || 0)} 个，资源文件 ${Number(finalJob.resourceFileCount || 0)} 个，总计 ${formatBytes(finalJob.totalBytes || 0)}。`
+    const structuredCount = Number(finalJob.structuredFileCount || 0)
+    const structuredPart = structuredCount > 0 ? `，结构化数据 ${structuredCount} 个` : ''
+    task.value.detail = `打包完成：数据库 ${Number(finalJob.databaseCount || 0)} 个，资源文件 ${Number(finalJob.resourceFileCount || 0)} 个${structuredPart}，总计 ${formatBytes(finalJob.totalBytes || 0)}。`
 
     if (isDesktopExportRuntime()) {
       task.value.outputPath = String(finalJob.zipPath || '').trim()

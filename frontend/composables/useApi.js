@@ -916,6 +916,7 @@ export const useApi = () => {
         output_dir: payload.output_dir == null ? null : String(payload.output_dir || '').trim(),
         include_databases: payload.include_databases == null ? true : !!payload.include_databases,
         include_resources: payload.include_resources == null ? true : !!payload.include_resources,
+        include_structured: payload.include_structured == null ? false : !!payload.include_structured,
         file_name: payload.file_name || null
       }
     })
