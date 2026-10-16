@@ -33,6 +33,23 @@
         </button>
       </div>
 
+      <!-- Context Center -->
+      <div
+        class="sidebar-rail-action w-full h-[var(--sidebar-rail-step)] flex items-center justify-center cursor-pointer group"
+        title="上下文中心"
+        @click="goContextHome"
+      >
+        <div class="sidebar-rail-plate w-[var(--sidebar-rail-btn)] h-[var(--sidebar-rail-btn)] rounded-md flex items-center justify-center transition-colors bg-transparent">
+          <div class="sidebar-rail-icon w-[var(--sidebar-rail-icon)] h-[var(--sidebar-rail-icon)]" :class="{ 'sidebar-rail-icon-active': isContextRoute }">
+            <svg class="w-full h-full" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 10.5 12 4l9 6.5" />
+              <path d="M5 9.5V20h14V9.5" />
+              <path d="M9.5 20v-5.5h5V20" />
+            </svg>
+          </div>
+        </div>
+      </div>
+
       <!-- Chat -->
       <div
         class="sidebar-rail-action w-full h-[var(--sidebar-rail-step)] flex items-center justify-center cursor-pointer group"
@@ -387,7 +404,7 @@
           <div v-else-if="!switchableAccountItems.length" class="space-y-1 px-1 py-2">
             <div class="text-[12px] text-[#666]">暂无可切换账号</div>
             <div class="text-[11px] leading-relaxed text-[#8a8a8a]">
-              获取并保存数据库密钥，或导入已解密的聊天数据后即可切换账号。
+              微信上下文保存完成后即可切换账号，也可以到上下文中心导入已有备份。
             </div>
             <ErrorNotice v-if="chatAccounts.error" :message="chatAccounts.error" compact class="text-[11px] text-red-600" />
           </div>
@@ -458,7 +475,7 @@
 
             <div class="rounded-[8px] border border-[#ededed] bg-[#fafafa] px-3 py-2 text-[12px] text-[#5f5f5f] space-y-1.5">
             <div class="flex items-start justify-between gap-3">
-              <span class="text-[#8a8a8a] shrink-0">本地解密库数量</span>
+              <span class="text-[#8a8a8a] shrink-0">本地上下文库数量</span>
               <span class="font-medium text-[#333]">{{ accountInfo?.database_count ?? '—' }}</span>
             </div>
             <div class="flex items-start justify-between gap-3">
@@ -779,6 +796,7 @@ const selectAccountFromDialog = async (account) => {
 
 const isChatRoute = computed(() => route.path?.startsWith('/chat'))
 const isSnsRoute = computed(() => route.path?.startsWith('/sns'))
+const isContextRoute = computed(() => route.path === '/')
 const isFavoritesRoute = computed(() => route.path?.startsWith('/favorites'))
 const isContactsRoute = computed(() => route.path?.startsWith('/contacts'))
 const isBizRoute = computed(() => route.path?.startsWith('/biz')) // 新增
@@ -787,6 +805,7 @@ const isFinderRoute = computed(() => route.path?.startsWith('/finder'))
 const isPaymentsRoute = computed(() => route.path?.startsWith('/payments'))
 const isWrappedRoute = computed(() => route.path?.startsWith('/wrapped'))
 
+const goContextHome = async () => { await navigateTo('/') }
 const goChat = async () => { await navigateTo('/chat') }
 const goSns = async () => { await navigateTo('/sns') }
 const goFavorites = async () => { await navigateTo('/favorites') }

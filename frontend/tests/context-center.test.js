@@ -1,0 +1,74 @@
+import { mount, flushPromises } from '@vue/test-utils'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import ContextHome from '../pages/index.vue'
+
+const api = {
+  getContextSources: vi.fn(),
+  getContextSettings: vi.fn(),
+  updateContextSettings: vi.fn(),
+  triggerWechatSync: vi.fn()
+}
+let wrapper
+
+const sourcesPayload = () => ({
+  status: 'ok',
+  sources: [
+    { source_id: 'wechat', name: '微信数据', enabled: true, state: 'up_to_date', last_saved_at: '2026-10-14T10:00:00', summary: { accounts: 1, account: 'wxid_a', successful_databases: 12 }, planned: false },
+    { source_id: 'browser_history', name: '浏览器记录', enabled: false, state: 'planned', last_saved_at: null, summary: { description: '将以浏览器插件方式接入（豆包、Qwen 等浏览记录），插件随应用安装并可更新。' }, planned: true },
+    { source_id: 'computer_activity', name: '电脑操作记录', enabled: false, state: 'planned', last_saved_at: null, summary: { description: '记录本机操作行为' }, planned: true },
+    { source_id: 'mobile_upload', name: '手机上传', enabled: false, state: 'planned', last_saved_at: null, summary: { description: '配合手机端 NextCloud 应用' }, planned: true },
+    { source_id: 'custom_capture', name: '定制浏览器抓取', enabled: false, state: 'planned', last_saved_at: null, summary: { description: '自动生成定制浏览器插件' }, planned: true }
+  ]
+})
+
+beforeEach(() => {
+  vi.stubGlobal('useApi', () => api)
+  vi.stubGlobal('navigateTo', vi.fn())
+  api.getContextSources.mockReset().mockImplementation(async () => sourcesPayload())
+  api.getContextSettings.mockReset().mockResolvedValue({ status: 'ok', settings: { wechat: { enabled: true } } })
+  api.updateContextSettings.mockReset().mockResolvedValue({ status: 'ok', settings: { wechat: { enabled: false } } })
+  api.triggerWechatSync.mockReset().mockResolvedValue({ status: 0, errmsg: 'ok', state: 'up_to_date', summary: { accounts: 1 } })
+})
+
+afterEach(() => { wrapper?.unmount(); vi.unstubAllGlobals() })
+
+const mountHome = async () => {
+  wrapper = mount(ContextHome, { global: { stubs: { GlobalExportDialog: true } } })
+  await flushPromises()
+  return wrapper
+}
+
+describe('上下文中心首页', () => {
+  it('渲染微信卡片与四个规划中的数据源', async () => {
+    const w = await mountHome()
+    expect(w.text()).toContain('微信数据')
+    expect(w.text()).toContain('已是最新')
+    expect(w.text()).toContain('2026-10-14T10:00:00')
+    expect(w.text()).toContain('浏览器记录')
+    expect(w.text()).toContain('将以浏览器插件方式接入')
+    const plannedBadges = w.findAll('.rounded-full').filter(b => b.text() === '规划中')
+    expect(plannedBadges).toHaveLength(4)
+  })
+
+  it('切换自动保存开关调用设置接口', async () => {
+    const w = await mountHome()
+    await w.find('input[type=checkbox]').setValue(false)
+    await flushPromises()
+    expect(api.updateContextSettings).toHaveBeenCalled()
+    expect(api.updateContextSettings.mock.calls[0][0]).toEqual({ wechat: { enabled: false } })
+  })
+
+  it('立即保存调用触发接口并展示结果', async () => {
+    const w = await mountHome()
+    await w.findAll('button').find(b => b.text() === '立即保存').trigger('click')
+    await flushPromises()
+    expect(api.triggerWechatSync).toHaveBeenCalledTimes(1)
+    expect(w.text()).toContain('本轮保存已完成。')
+  })
+
+  it('页面文案不出现解密与密钥字样', async () => {
+    const w = await mountHome()
+    expect(w.text()).not.toContain('解密')
+    expect(w.text()).not.toContain('密钥')
+  })
+})

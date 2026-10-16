@@ -6,61 +6,48 @@ import { parse } from '@vue/compiler-sfc'
 
 const source = readFileSync(new URL('../pages/index.vue', import.meta.url), 'utf8')
 const script = parse(source).descriptor.scriptSetup.content.replace(/^import .*$/gm, '')
-const settings = readFileSync(new URL('../lib/desktop-settings.js', import.meta.url), 'utf8')
-  .replace(/^export /gm, '')
 
-const runStartup = async ({ stored = null, accounts = ['ready-account'], accepted = true, fails = false, query = {} } = {}) => {
+const runStartup = async ({ fails = false } = {}) => {
   let mounted
-  let contextAvailable = true
   const paths = []
   const warnings = []
-  const router = { replace: async path => paths.push(path) }
-  const getRouter = () => {
-    if (!contextAvailable) throw new Error('Nuxt 上下文不可用')
-    return router
-  }
-  vm.runInNewContext(`${settings}\n${script}`, {
+  vm.runInNewContext(script, {
     process: { client: true }, window: {},
-    localStorage: { getItem: () => stored },
     ref: value => ({ value }),
+    computed: getter => ({ get value() { return getter() } }),
     onMounted: callback => { mounted = callback },
-    useRouter: getRouter,
-    useRoute: () => ({ query }),
-    navigateTo: path => getRouter().replace(path),
-    isFirstUseAgreementAccepted: () => accepted,
+    navigateTo: async path => { paths.push(path) },
     console: { warn: (...args) => warnings.push(args) },
-    useApi: () => ({ listChatAccounts: async () => {
-      await Promise.resolve()
-      // 模拟异步请求结束后，组合式函数不再能获取组件上下文。
-      contextAvailable = false
-      if (fails) throw new Error('账号服务暂时不可用')
-      return { accounts }
-    } }),
+    useApi: () => ({
+      getContextSources: async () => {
+        await Promise.resolve()
+        if (fails) throw new Error('上下文服务暂时不可用')
+        return {
+          status: 'ok',
+          sources: [
+            { source_id: 'wechat', name: '微信数据', enabled: true, state: 'up_to_date', last_saved_at: '2026-10-14T10:00:00', summary: { accounts: 1, account: 'wxid_a' }, planned: false },
+            { source_id: 'browser_history', name: '浏览器记录', enabled: false, state: 'planned', last_saved_at: null, summary: {}, planned: true }
+          ]
+        }
+      },
+      getContextSettings: async () => ({ status: 'ok', settings: { wechat: { enabled: true } } }),
+      updateContextSettings: async () => ({ status: 'ok', settings: { wechat: { enabled: true } } }),
+      triggerWechatSync: async () => ({ status: 0, errmsg: 'ok', state: 'up_to_date', summary: { accounts: 1 } })
+    }),
   })
   await mounted()
+  await new Promise(resolve => setImmediate(resolve))
   return { paths, warnings }
 }
 
-test('默认开启时，账号请求结束后仍能跳转到回看页', async () => {
+test('启动后停留在上下文中心，不自动跳转到聊天页', async () => {
   const result = await runStartup()
-  assert.deepEqual(result.paths, ['/chat'])
+  assert.deepEqual(result.paths, [])
   assert.equal(result.warnings.length, 0)
 })
 
-test('手动关闭、没有账号或未同意协议时不自动跳转', async () => {
-  for (const options of [{ stored: 'false' }, { accounts: [] }, { accepted: false }]) {
-    assert.deepEqual((await runStartup(options)).paths, [])
-  }
-})
-
-test('账号请求失败时留在首页并记录原因', async () => {
+test('上下文加载失败时记录错误并留在首页', async () => {
   const result = await runStartup({ fails: true })
-  assert.deepEqual(result.paths, [])
-  assert.equal(result.warnings.length, 1)
-})
-
-test('有数据且默认跳转开启时，主动进入引导页仍停留在引导页', async () => {
-  const result = await runStartup({ query: { guide: '1' } })
   assert.deepEqual(result.paths, [])
   assert.equal(result.warnings.length, 0)
 })

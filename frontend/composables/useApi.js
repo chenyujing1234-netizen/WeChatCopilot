@@ -1222,9 +1222,34 @@ export const useApi = () => {
     })
   }
 
+  // 上下文中心API
+  const getContextSources = async () => {
+    return await request('/context/sources')
+  }
+
+  const getContextSettings = async () => {
+    return await request('/context/settings')
+  }
+
+  const updateContextSettings = async (data) => {
+    return await request('/context/settings', {
+      method: 'PUT',
+      body: data
+    })
+  }
+
+  const triggerWechatSync = async () => {
+    return await request('/context/wechat/sync-now', {
+      method: 'POST'
+    })
+  }
 
   return {
     pickSystemDirectory,
+    getContextSources,
+    getContextSettings,
+    updateContextSettings,
+    triggerWechatSync,
     getImgHelperStatus,
     toggleImgHelper,
     getCdnImageStatus,

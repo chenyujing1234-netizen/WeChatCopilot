@@ -1,189 +1,199 @@
 <template>
-  <div class="landing-page theme-scope theme-page relative h-full min-h-0 overflow-auto px-4 py-6 text-[#000000e6] sm:px-6 sm:py-8">
-    <div class="pointer-events-none absolute inset-0 bg-grid-pattern opacity-5"></div>
-    <div class="pointer-events-none absolute left-20 top-20 h-72 w-72 rounded-full bg-[#07C160] opacity-5 blur-3xl"></div>
-    <div class="pointer-events-none absolute right-20 top-40 h-96 w-96 rounded-full bg-[#10AEEF] opacity-5 blur-3xl"></div>
-    <div class="pointer-events-none absolute bottom-0 left-40 h-80 w-80 rounded-full bg-[#91D300] opacity-5 blur-3xl"></div>
+  <div class="min-h-screen px-6 py-10 md:px-10">
+    <div class="mx-auto w-full max-w-[980px]">
+      <header class="flex items-center gap-4">
+        <img src="/logo.png" alt="ContextBuddy Logo" class="h-16 w-16 shrink-0 object-contain" />
+        <div>
+          <h1 class="text-2xl font-bold text-[#000000e6]">ContextBuddy</h1>
+          <p class="mt-1 text-[13px] leading-6 text-[#7F7F7F]">把你的上下文自动保存在本地，需要时随时查看。</p>
+        </div>
+      </header>
 
-    <main class="relative z-10 mx-auto flex min-h-full w-full max-w-6xl flex-col justify-start lg:justify-center">
-      <section class="space-y-5">
-        <div class="flex flex-col gap-5 rounded-lg border border-[#EDEDED] bg-white/78 p-6 backdrop-blur sm:p-8 lg:flex-row lg:items-center lg:justify-between">
-          <div class="flex items-start gap-4 text-left">
-            <img src="/logo.png" alt="微信解密助手Logo" class="h-16 w-16 shrink-0 object-contain" />
-            <div>
-              <p class="text-[13px] font-medium tracking-[0.16em] text-[#07C160]">本地整理·安心备份</p>
-              <h1 class="mt-3 text-[34px] font-semibold leading-tight tracking-[-0.04em] text-[#000000e6] sm:text-[46px]">
-                把微信记录留在本地
-              </h1>
-              <p class="mt-3 max-w-2xl text-[15px] leading-7 text-[#6B7280]">
-                从检测开始，再查看聊天、导入备份或导出归档。
-              </p>
+      <div v-if="error" class="mt-6 rounded-[10px] border border-red-200 bg-red-50 px-4 py-3 text-[13px] text-red-600">
+        {{ error }}
+      </div>
+
+      <!-- 微信上下文卡片 -->
+      <section class="mt-8 rounded-[14px] border border-[#e8e8e8] bg-white p-6 shadow-[0_10px_40px_-24px_rgba(0,0,0,0.35)]">
+        <div class="flex items-start justify-between gap-4">
+          <div class="min-w-0">
+            <div class="flex items-center gap-2">
+              <h2 class="text-[16px] font-semibold text-[#000000e6]">{{ wechatSource?.name || '微信数据' }}</h2>
+              <span class="rounded-full px-2 py-0.5 text-[11px] font-medium" :class="stateBadgeClass">{{ stateText }}</span>
             </div>
+            <p class="mt-2 text-[13px] leading-6 text-[#7F7F7F]">微信登录后自动保存聊天等数据到本机，并保持实时更新。</p>
           </div>
-
-          <button
-            type="button"
-            class="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg bg-[#07C160] px-6 py-3 text-[14px] font-medium text-white transition hover:bg-[#06AD56] focus:outline-none focus:ring-2 focus:ring-[#07C160]/25"
-            @click="startDetection"
-          >
-            <svg class="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-            </svg>
-            <span>开始检测</span>
-          </button>
+          <label class="flex shrink-0 cursor-pointer items-center gap-2 text-[12px] text-[#5f5f5f]" title="自动保存总开关">
+            <span>自动保存</span>
+            <input
+              type="checkbox"
+              class="h-[18px] w-[18px] accent-[#07c160]"
+              :checked="wechatEnabled"
+              :disabled="loading || toggling"
+              @change="toggleWechatEnabled"
+            />
+          </label>
         </div>
 
-        <div class="grid gap-4 lg:grid-cols-[1.25fr_0.75fr]">
+        <div class="mt-5 grid grid-cols-2 gap-3 rounded-[10px] bg-[#fafafa] px-4 py-3 text-[12px] text-[#5f5f5f] md:grid-cols-3">
+          <div>
+            <div class="text-[#8a8a8a]">已保存账号</div>
+            <div class="mt-1 font-medium text-[#222]">{{ wechatSummary.accounts ?? '—' }}</div>
+          </div>
+          <div>
+            <div class="text-[#8a8a8a]">最近保存</div>
+            <div class="mt-1 font-medium text-[#222]">{{ wechatSource?.last_saved_at || '尚未保存' }}</div>
+          </div>
+          <div>
+            <div class="text-[#8a8a8a]">当前账号</div>
+            <div class="mt-1 truncate font-medium text-[#222]">{{ wechatSummary.account || '—' }}</div>
+          </div>
+        </div>
+
+        <div class="mt-5 flex flex-wrap items-center gap-3">
           <button
             type="button"
-            class="group min-h-[300px] rounded-lg border border-[#CFEEDB] bg-[#F3FFF8] p-6 text-left transition hover:border-[#AEE6C4] hover:bg-[#EFFAF3] focus:outline-none focus:ring-2 focus:ring-[#07C160]/20 sm:p-8"
-            @click="startDetection"
+            class="rounded-[8px] bg-[#07c160] px-4 py-2 text-[13px] font-medium text-white transition hover:bg-[#06ad56] disabled:opacity-60"
+            :disabled="syncing"
+            @click="syncNow"
           >
-            <div class="flex h-full flex-col justify-between gap-8">
-              <div>
-                <div class="flex items-center gap-3 text-[#07C160]">
-                  <svg class="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-                  </svg>
-                  <span class="text-[13px] font-medium">推荐第一步</span>
-                </div>
-                <h2 class="mt-5 text-[28px] font-semibold tracking-[-0.03em] text-[#000000e6] sm:text-[36px]">检测本机微信数据</h2>
-                <p class="mt-3 max-w-xl text-[14px] leading-7 text-[#6B7280]">
-                  找到可用账号、数据库文件和本地路径，后续查看、解密和归档都从这里开始。
-                </p>
-              </div>
-
-              <div class="flex items-center justify-between border-t border-[#DDF4E7] pt-5">
-                <span class="text-[13px] font-medium text-[#07C160]">开始检测</span>
-                <svg class="h-5 w-5 text-[#07C160] transition group-hover:translate-x-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
-                </svg>
-              </div>
-            </div>
+            {{ syncing ? '正在保存…' : '立即保存' }}
           </button>
+          <button
+            type="button"
+            class="rounded-[8px] border border-[#e4e4e4] bg-white px-4 py-2 text-[13px] font-medium text-[#333] transition hover:border-[#07c160] hover:text-[#07c160]"
+            @click="viewWechatContext"
+          >
+            查看微信上下文
+          </button>
+          <div class="ml-auto flex items-center gap-4 text-[12px] text-[#8a8a8a]">
+            <a class="cursor-pointer hover:text-[#07c160]" title="导入已有备份" @click="goImport">导入备份</a>
+            <a class="cursor-pointer hover:text-[#07c160]" title="检测本机微信数据" @click="goDetection">账号检测</a>
+            <a class="cursor-pointer hover:text-[#07c160]" title="导出已保存数据" @click="openExportDialog">导出</a>
+          </div>
+        </div>
+        <p v-if="syncMessage" class="mt-3 text-[12px] leading-5" :class="syncMessageOk ? 'text-[#07964c]' : 'text-red-500'">{{ syncMessage }}</p>
+      </section>
 
-          <div class="grid gap-4">
-            <NuxtLink
-              to="/import"
-              class="group rounded-lg border border-[#EDEDED] bg-white/72 p-5 text-left transition hover:border-[#CFEEDB] hover:bg-[#F7FDF9] focus:outline-none focus:ring-2 focus:ring-[#07C160]/20"
-            >
-              <div class="flex items-start justify-between gap-4">
-                <div>
-                  <div class="flex items-center gap-2 text-[15px] font-medium text-[#000000e6]">
-                    <svg class="h-5 w-5 text-[#07C160]" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                    </svg>
-                    <span>导入备份</span>
-                  </div>
-                  <p class="mt-2 text-[13px] leading-6 text-[#7F7F7F]">接入已准备好的本地备份目录。</p>
-                </div>
-                <svg class="mt-1 h-4 w-4 shrink-0 text-[#A1A1AA] transition group-hover:translate-x-0.5 group-hover:text-[#07C160]" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
-                </svg>
-              </div>
-            </NuxtLink>
-
-            <button
-              type="button"
-              class="group rounded-lg border border-[#EDEDED] bg-white/72 p-5 text-left transition hover:border-[#CFEEDB] hover:bg-[#F7FDF9] focus:outline-none focus:ring-2 focus:ring-[#07C160]/20"
-              @click="openExportDialog"
-            >
-              <div class="flex items-start justify-between gap-4">
-                <div>
-                  <div class="flex items-center gap-2 text-[15px] font-medium text-[#000000e6]">
-                    <svg class="h-5 w-5 text-[#07C160]" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v11" />
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7.5 10.5L12 15l4.5-4.5" />
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 19h16" />
-                    </svg>
-                    <span>导出归档</span>
-                  </div>
-                  <p class="mt-2 text-[13px] leading-6 text-[#7F7F7F]">打包当前账号的数据库和资源文件。</p>
-                </div>
-                <svg class="mt-1 h-4 w-4 shrink-0 text-[#A1A1AA] transition group-hover:translate-x-0.5 group-hover:text-[#07C160]" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
-                </svg>
-              </div>
-            </button>
-
-            <NuxtLink
-              to="/chat"
-              class="group rounded-lg border border-[#EDEDED] bg-white/72 p-5 text-left transition hover:border-[#CFEEDB] hover:bg-[#F7FDF9] focus:outline-none focus:ring-2 focus:ring-[#07C160]/20"
-            >
-              <div class="flex items-start justify-between gap-4">
-                <div>
-                  <div class="flex items-center gap-2 text-[15px] font-medium text-[#000000e6]">
-                    <svg class="h-5 w-5 text-[#07C160]" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h8M8 14h5M4 6h16v12a2 2 0 01-2 2H6a2 2 0 01-2-2V6z" />
-                    </svg>
-                    <span>回看聊天</span>
-                  </div>
-                  <p class="mt-2 text-[13px] leading-6 text-[#7F7F7F]">查看会话、搜索片段，找到需要的内容。</p>
-                </div>
-                <svg class="mt-1 h-4 w-4 shrink-0 text-[#A1A1AA] transition group-hover:translate-x-0.5 group-hover:text-[#07C160]" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
-                </svg>
-              </div>
-            </NuxtLink>
+      <!-- 规划中的数据源 -->
+      <section class="mt-8">
+        <h3 class="text-[14px] font-semibold text-[#000000e6]">更多上下文来源（规划中）</h3>
+        <div class="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
+          <div
+            v-for="source in plannedSources"
+            :key="source.source_id"
+            class="rounded-[12px] border border-dashed border-[#dcdcdc] bg-white/70 px-5 py-4"
+          >
+            <div class="flex items-center justify-between gap-3">
+              <span class="text-[14px] font-medium text-[#000000e6]">{{ source.name }}</span>
+              <span class="rounded-full bg-[#f2f2f2] px-2 py-0.5 text-[11px] text-[#8a8a8a]">规划中</span>
+            </div>
+            <p class="mt-2 text-[12px] leading-5 text-[#7F7F7F]">{{ source.summary?.description || '即将接入。' }}</p>
           </div>
         </div>
       </section>
-    </main>
+    </div>
 
     <GlobalExportDialog :open="exportDialogOpen" @close="closeExportDialog" />
   </div>
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
-import { useApi } from '~/composables/useApi'
-import { DESKTOP_SETTING_DEFAULT_TO_CHAT_KEY, readLocalBoolSetting } from '~/lib/desktop-settings'
-import { isFirstUseAgreementAccepted } from '~/lib/first-use-agreement'
+import { computed, onMounted, ref } from 'vue'
 
-const { listChatAccounts } = useApi()
-const router = useRouter()
-const route = useRoute()
+const { getContextSources, getContextSettings, updateContextSettings, triggerWechatSync } = useApi()
+
+const sources = ref([])
+const wechatEnabled = ref(true)
+const loading = ref(true)
+const toggling = ref(false)
+const syncing = ref(false)
+const error = ref('')
+const syncMessage = ref('')
+const syncMessageOk = ref(true)
 const exportDialogOpen = ref(false)
 
-onMounted(async () => {
-  if (!process.client || typeof window === 'undefined') return
-  if (!isFirstUseAgreementAccepted()) return
-  // 用户主动打开引导页时，保留当前页面，不执行启动时的自动跳转。
-  if (route.query.guide === '1') return
+const wechatSource = computed(() => sources.value.find(s => s.source_id === 'wechat') || null)
+const plannedSources = computed(() => sources.value.filter(s => s.source_id !== 'wechat'))
+const wechatSummary = computed(() => wechatSource.value?.summary || {})
 
-  const enabled = readLocalBoolSetting(DESKTOP_SETTING_DEFAULT_TO_CHAT_KEY, true)
-  if (!enabled) return
+const STATE_TEXT = {
+  idle: '待自动保存',
+  wechat_detected: '已检测到微信',
+  saving: '正在保存',
+  up_to_date: '已是最新',
+  waiting_wechat: '等待微信登录',
+  error: '保存出错，稍后重试',
+  disabled: '已暂停'
+}
 
-  try {
-    const resp = await listChatAccounts()
-    const accounts = resp?.accounts || []
-    if (accounts.length) {
-      // 提前获取路由实例，避免等待账号请求后丢失 Nuxt 上下文。
-      await router.replace('/chat')
-    }
-  } catch (error) {
-    console.warn('启动时自动进入聊天页失败：', error)
-  }
+const stateText = computed(() => STATE_TEXT[wechatSource.value?.state || 'idle'] || '待自动保存')
+
+const stateBadgeClass = computed(() => {
+  const state = wechatSource.value?.state || 'idle'
+  if (state === 'up_to_date') return 'bg-[#eefbf4] text-[#07964c]'
+  if (state === 'saving' || state === 'wechat_detected') return 'bg-[#fff7e6] text-[#b7791f]'
+  if (state === 'error') return 'bg-[#fdecec] text-[#c53030]'
+  return 'bg-[#f2f2f2] text-[#8a8a8a]'
 })
 
-const openExportDialog = () => {
-  exportDialogOpen.value = true
+const reload = async () => {
+  try {
+    const [sourcesResp, settingsResp] = await Promise.all([
+      getContextSources(),
+      getContextSettings()
+    ])
+    sources.value = sourcesResp?.sources || []
+    wechatEnabled.value = !!(settingsResp?.settings?.wechat?.enabled)
+  } catch (e) {
+    error.value = e?.message || '加载上下文状态失败'
+  } finally {
+    loading.value = false
+  }
 }
 
-const closeExportDialog = () => {
-  exportDialogOpen.value = false
+const toggleWechatEnabled = async (event) => {
+  const enabled = !!event?.target?.checked
+  toggling.value = true
+  wechatEnabled.value = enabled
+  try {
+    await updateContextSettings({ wechat: { enabled } })
+    await reload()
+  } catch (e) {
+    wechatEnabled.value = !enabled
+    error.value = e?.message || '保存开关失败'
+  } finally {
+    toggling.value = false
+  }
 }
 
-const startDetection = async () => {
-  await navigateTo('/detection-result')
+const syncNow = async () => {
+  syncing.value = true
+  syncMessage.value = ''
+  try {
+    const resp = await triggerWechatSync()
+    if (resp?.status === 0) {
+      syncMessageOk.value = true
+      syncMessage.value = '本轮保存已完成。'
+    } else {
+      syncMessageOk.value = false
+      syncMessage.value = resp?.errmsg || '本轮保存未完成，稍后会自动重试。'
+    }
+    await reload()
+  } catch (e) {
+    syncMessageOk.value = false
+    syncMessage.value = e?.message || '触发保存失败'
+  } finally {
+    syncing.value = false
+  }
 }
+
+const viewWechatContext = async () => { await navigateTo('/chat') }
+const goImport = async () => { await navigateTo('/import') }
+const goDetection = async () => { await navigateTo('/detection-result') }
+
+const openExportDialog = () => { exportDialogOpen.value = true }
+const closeExportDialog = () => { exportDialogOpen.value = false }
+
+onMounted(() => { void reload() })
 </script>
-
-<style scoped>
-.bg-grid-pattern {
-  background-image:
-    linear-gradient(rgba(7, 193, 96, 0.1) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(7, 193, 96, 0.1) 1px, transparent 1px);
-  background-size: 50px 50px;
-}
-</style>
