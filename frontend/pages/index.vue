@@ -50,6 +50,28 @@
           </div>
         </div>
 
+        <div class="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-[10px] bg-[#fafafa] px-4 py-2.5 text-[12px]">
+          <span class="shrink-0 text-[#8a8a8a]">保存位置</span>
+          <span class="min-w-0 flex-1 truncate font-medium text-[#222]" :title="dataDirEffective">{{ dataDirEffective || '尚未指定' }}</span>
+          <button
+            type="button"
+            class="shrink-0 cursor-pointer text-[#07c160] hover:underline disabled:cursor-not-allowed disabled:opacity-60"
+            :disabled="changingDir"
+            @click="changeDataDir"
+          >
+            {{ changingDir ? '正在处理…' : '更改' }}
+          </button>
+          <button
+            v-if="dataDirCustom"
+            type="button"
+            class="shrink-0 cursor-pointer text-[#8a8a8a] hover:text-[#07c160] disabled:cursor-not-allowed disabled:opacity-60"
+            :disabled="changingDir"
+            @click="resetDataDir"
+          >
+            恢复默认
+          </button>
+        </div>
+
         <div class="mt-5 flex flex-wrap items-center gap-3">
           <button
             type="button"
@@ -208,6 +230,44 @@ const syncNow = async () => {
 
 const viewWechatContext = async () => { await navigateTo('/chat') }
 const goImport = async () => { await navigateTo('/import') }
+
+// 保存位置：默认显示应用数据目录，用户可更改；切换时后端会把已保存的数据复制到新位置
+const changingDir = ref(false)
+const dataDirCustom = computed(() => !!wechatSource.value?.data_dir)
+const dataDirEffective = computed(() => wechatSource.value?.data_dir_effective || '')
+
+const applyDataDir = async (dir) => {
+  changingDir.value = true
+  error.value = ''
+  syncMessageOk.value = true
+  syncMessage.value = '正在切换保存位置，已保存的数据复制完成后自动生效…'
+  try {
+    await updateContextSettings({ wechat: { data_dir: dir } })
+    await reload()
+    syncMessage.value = dir ? '保存位置已更新，已保存的数据已复制到新位置。' : '已恢复默认保存位置。'
+  } catch (e) {
+    syncMessageOk.value = false
+    syncMessage.value = e?.message || '更新保存位置失败'
+  } finally {
+    changingDir.value = false
+  }
+}
+
+const changeDataDir = async () => {
+  if (changingDir.value) return
+  let dir = ''
+  if (window?.wechatDesktop?.chooseDirectory) {
+    const result = await window.wechatDesktop.chooseDirectory({ title: '选择微信数据保存位置' })
+    if (!result || result.canceled || !Array.isArray(result.filePaths) || !result.filePaths.length) return
+    dir = String(result.filePaths[0] || '').trim()
+  } else {
+    dir = String(window.prompt('请输入微信数据保存位置的绝对路径') || '').trim()
+  }
+  if (!dir) return
+  await applyDataDir(dir)
+}
+
+const resetDataDir = () => applyDataDir('')
 
 // 账号检测在首页浮层中运行，主界面保持挂载不跳转
 const detectionOpen = ref(false)

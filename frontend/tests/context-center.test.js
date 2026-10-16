@@ -14,7 +14,7 @@ let navigateToMock
 const sourcesPayload = () => ({
   status: 'ok',
   sources: [
-    { source_id: 'wechat', name: '微信数据', enabled: true, state: 'up_to_date', last_saved_at: '2026-10-14T10:00:00', summary: { accounts: 1, account: 'wxid_a', successful_databases: 12 }, planned: false },
+    { source_id: 'wechat', name: '微信数据', enabled: true, state: 'up_to_date', last_saved_at: '2026-10-14T10:00:00', summary: { accounts: 1, account: 'wxid_a', successful_databases: 12 }, planned: false, data_dir: '', data_dir_effective: 'C:\\Users\\dev\\AppData\\Roaming\\ContextBuddy\\output\\databases' },
     { source_id: 'browser_history', name: '浏览器记录', enabled: false, state: 'planned', last_saved_at: null, summary: { description: '将以浏览器插件方式接入（豆包、Qwen 等浏览记录），插件随应用安装并可更新。' }, planned: true },
     { source_id: 'computer_activity', name: '电脑操作记录', enabled: false, state: 'planned', last_saved_at: null, summary: { description: '记录本机操作行为' }, planned: true },
     { source_id: 'mobile_upload', name: '手机上传', enabled: false, state: 'planned', last_saved_at: null, summary: { description: '配合手机端 NextCloud 应用' }, planned: true },
@@ -66,6 +66,43 @@ describe('上下文中心首页', () => {
     await flushPromises()
     expect(api.triggerWechatSync).toHaveBeenCalledTimes(1)
     expect(w.text()).toContain('本轮保存已完成。')
+  })
+
+  it('显示保存位置的生效路径，默认不显示恢复默认按钮', async () => {
+    const w = await mountHome()
+    expect(w.text()).toContain('保存位置')
+    expect(w.text()).toContain('C:\\Users\\dev\\AppData\\Roaming\\ContextBuddy\\output\\databases')
+    expect(w.findAll('button').find(b => b.text() === '恢复默认')).toBeUndefined()
+  })
+
+  it('更改保存位置调用设置接口并提示完成', async () => {
+    const w = await mountHome()
+    const promptMock = vi.spyOn(window, 'prompt').mockReturnValue('D:\\MyWechatData')
+    try {
+      await w.findAll('button').find(b => b.text() === '更改').trigger('click')
+      await flushPromises()
+      expect(promptMock).toHaveBeenCalled()
+      expect(api.updateContextSettings).toHaveBeenCalledWith({ wechat: { data_dir: 'D:\\MyWechatData' } })
+      expect(w.text()).toContain('保存位置已更新')
+    } finally {
+      promptMock.mockRestore()
+    }
+  })
+
+  it('自定义路径时显示恢复默认，点击后传空路径', async () => {
+    api.getContextSources.mockReset().mockImplementation(async () => {
+      const payload = sourcesPayload()
+      payload.sources[0].data_dir = 'D:\\MyWechatData'
+      payload.sources[0].data_dir_effective = 'D:\\MyWechatData'
+      return payload
+    })
+    const w = await mountHome()
+    const resetButton = w.findAll('button').find(b => b.text() === '恢复默认')
+    expect(resetButton).toBeDefined()
+    await resetButton.trigger('click')
+    await flushPromises()
+    expect(api.updateContextSettings).toHaveBeenCalledWith({ wechat: { data_dir: '' } })
+    expect(w.text()).toContain('已恢复默认保存位置。')
   })
 
   it('页面文案不出现解密与密钥字样', async () => {

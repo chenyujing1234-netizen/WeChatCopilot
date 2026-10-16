@@ -87,6 +87,78 @@ def test_sync_now_error_is_generic(client, monkeypatch):
     assert "解密" not in body["errmsg"]
 
 
+@pytest.fixture
+def quiet_autosave_services(monkeypatch):
+    """切换保存位置会停/起自动保存服务，测试中全部 mock 掉避免真实线程。"""
+    monkeypatch.setattr(context_router.WECHAT_AUTOSAVE, "start", mock.Mock())
+    monkeypatch.setattr(context_router.WECHAT_AUTOSAVE, "stop", mock.Mock())
+    monkeypatch.setattr(context_router.CHAT_REALTIME_AUTOSYNC, "stop", mock.Mock())
+
+
+def test_settings_data_dir_roundtrip(client, monkeypatch, tmp_path, quiet_autosave_services):
+    target = tmp_path / "custom_store"
+
+    resp = client.put("/api/context/settings", json={"wechat": {"data_dir": str(target)}})
+
+    assert resp.status_code == 200
+    assert resp.json()["settings"]["wechat"]["data_dir"] == str(target)
+    assert target.is_dir()
+
+    from wechat_decrypt_tool.app_paths import get_output_databases_dir
+
+    assert str(get_output_databases_dir()) == str(target)
+
+    resp = client.get("/api/context/sources")
+    wechat = [s for s in resp.json()["sources"] if s["source_id"] == "wechat"][0]
+    assert wechat["data_dir"] == str(target)
+    assert wechat["data_dir_effective"] == str(target)
+
+
+def test_settings_data_dir_restore_default(client, monkeypatch, tmp_path, quiet_autosave_services):
+    target = tmp_path / "custom_store"
+    client.put("/api/context/settings", json={"wechat": {"data_dir": str(target)}})
+
+    resp = client.put("/api/context/settings", json={"wechat": {"data_dir": ""}})
+
+    assert resp.status_code == 200
+    assert resp.json()["settings"]["wechat"]["data_dir"] == ""
+    from wechat_decrypt_tool.app_paths import get_output_databases_dir
+
+    assert str(get_output_databases_dir()) != str(target)
+
+
+def test_settings_reject_relative_data_dir(client, quiet_autosave_services):
+    resp = client.put("/api/context/settings", json={"wechat": {"data_dir": "relative/path"}})
+
+    assert resp.status_code == 400
+    resp = client.get("/api/context/settings")
+    assert resp.json()["settings"]["wechat"]["data_dir"] == ""
+
+
+def test_settings_data_dir_migrates_existing_data(client, monkeypatch, tmp_path, quiet_autosave_services):
+    from wechat_decrypt_tool.app_paths import get_output_databases_dir
+
+    default_dir = get_output_databases_dir()
+    account_dir = default_dir / "wxid_test"
+    account_dir.mkdir(parents=True, exist_ok=True)
+    (account_dir / "Chat.db").write_bytes(b"fake-db-content")
+
+    target = tmp_path / "custom_store"
+    resp = client.put("/api/context/settings", json={"wechat": {"data_dir": str(target)}})
+
+    assert resp.status_code == 200
+    assert (target / "wxid_test" / "Chat.db").read_bytes() == b"fake-db-content"
+    # 旧数据保留，不做删除
+    assert (default_dir / "wxid_test" / "Chat.db").exists()
+
+
+def test_settings_data_dir_ignored_for_other_sources(client, quiet_autosave_services):
+    resp = client.put("/api/context/settings", json={"browser_history": {"data_dir": "C:\\somewhere"}})
+
+    assert resp.status_code == 200
+    assert "data_dir" not in resp.json()["settings"]["browser_history"]
+
+
 def test_local_only_blocks_remote_client():
     app = FastAPI()
     app.include_router(context_router.router)

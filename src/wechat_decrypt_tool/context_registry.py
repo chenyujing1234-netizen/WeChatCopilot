@@ -21,7 +21,7 @@ logger = get_logger(__name__)
 _SETTINGS_LOCK = threading.Lock()
 
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "wechat": {"enabled": True},
+    "wechat": {"enabled": True, "data_dir": ""},
     "browser_history": {"enabled": False},
     "computer_activity": {"enabled": False},
     "mobile_upload": {"enabled": False},
@@ -68,8 +68,10 @@ def save_settings(settings: dict[str, Any]) -> dict[str, Any]:
     for source_id, overrides in (settings or {}).items():
         if source_id not in normalized or not isinstance(overrides, dict):
             continue
+        # 各源仅允许更新自己的设置键：开关通用，保存位置仅微信数据源支持
+        allowed_keys = {"enabled"} | ({"data_dir"} if source_id == "wechat" else set())
         normalized[source_id].update(
-            {key: value for key, value in overrides.items() if key == "enabled"}
+            {key: value for key, value in overrides.items() if key in allowed_keys}
         )
     with _SETTINGS_LOCK:
         get_settings_path().write_text(
@@ -179,6 +181,8 @@ class WechatContextSource:
         except Exception:
             # wechat_autosave 尚未就绪（Task 4 前回退 manifest）
             pass
+        from .app_paths import get_output_databases_dir
+
         return {
             "source_id": self.source_id,
             "name": self.display_name,
@@ -187,6 +191,8 @@ class WechatContextSource:
             "last_saved_at": manifest.get("last_saved_at"),
             "summary": manifest.get("summary") or {},
             "planned": False,
+            "data_dir": str(settings.get("wechat", {}).get("data_dir") or ""),
+            "data_dir_effective": str(get_output_databases_dir()),
         }
 
     def start(self) -> None:
