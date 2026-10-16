@@ -1,4 +1,5 @@
 """wechat_autosave：微信上下文自动保存服务的状态机与保存链路。"""
+import threading
 import time
 from unittest import mock
 
@@ -175,7 +176,22 @@ def test_stored_key_failure_reacquires(svc, monkeypatch):
     assert svc.get_state()["state"] == "up_to_date"
 
 
-def test_sync_now_busy(isolated_data_dir):
+def _patch_save_dependencies(monkeypatch, successful_count=3):
+    """为成功保存路径打全依赖补丁，返回 decrypt mock。"""
+    monkeypatch.setattr(
+        wechat_autosave,
+        "get_account_keys_from_store",
+        mock.Mock(return_value={"db_key": "a" * 64}),
+    )
+    monkeypatch.setattr(wechat_autosave, "_acquire_decrypt_account_guards", mock.Mock(return_value=[]))
+    monkeypatch.setattr(wechat_autosave, "_release_decrypt_account_guards", mock.Mock())
+    decrypt = _patch_decrypt_ok(monkeypatch, successful_count)
+    monkeypatch.setattr(wechat_autosave, "_persist_db_keys", mock.Mock(return_value=(True, [])))
+    return decrypt
+
+
+def test_sync_now_busy(isolated_data_dir, monkeypatch):
+    monkeypatch.setattr(wechat_autosave, "_SYNC_NOW_WAIT_SECONDS", 0.05)
     wechat_autosave._wechat_running  # 确认模块可导入
     service = wechat_autosave.WechatAutosaveService()
     service._sync_lock.acquire()
@@ -185,6 +201,53 @@ def test_sync_now_busy(isolated_data_dir):
         assert "稍候" in result["errmsg"]
     finally:
         service._sync_lock.release()
+
+
+def test_sync_now_waits_for_inflight_round(svc, monkeypatch):
+    """在途轮持锁时，sync_now 等待其完成后执行，而不是立即报忙。"""
+    monkeypatch.setattr(wechat_autosave, "_SYNC_NOW_WAIT_SECONDS", 5.0)
+    decrypt = _patch_save_dependencies(monkeypatch)
+
+    svc._sync_lock.acquire()
+
+    def release_later():
+        time.sleep(0.1)
+        svc._sync_lock.release()
+
+    holder = threading.Thread(target=release_later)
+    holder.start()
+    try:
+        result = svc.sync_now()
+        assert result["status"] == 0
+        assert decrypt.call_count == 1
+    finally:
+        holder.join()
+
+
+def test_sync_now_reuses_recent_success(svc, monkeypatch):
+    """近期已成功保存时，sync_now 直接复用最近结果，不重复保存。"""
+    decrypt = _patch_save_dependencies(monkeypatch)
+
+    assert svc._run_once()["status"] == 0
+
+    result = svc.sync_now()
+
+    assert result["status"] == 0
+    assert result["summary"]["account"] == "wxid_test"
+    assert decrypt.call_count == 1
+
+
+def test_sync_now_reruns_after_success_window(svc, monkeypatch):
+    """超过近期成功窗口后，sync_now 重新执行一轮保存。"""
+    monkeypatch.setattr(wechat_autosave, "_RECENT_SUCCESS_SKIP_SECONDS", -1.0)
+    decrypt = _patch_save_dependencies(monkeypatch)
+
+    assert svc._run_once()["status"] == 0
+
+    result = svc.sync_now()
+
+    assert result["status"] == 0
+    assert decrypt.call_count == 2
 
 
 def test_disabled_reflects_settings(isolated_data_dir):

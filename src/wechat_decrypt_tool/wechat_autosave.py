@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from typing import Any
 
 from .app_paths import get_output_databases_dir
@@ -38,6 +39,10 @@ logger = get_logger(__name__)
 
 _INTERVAL_SECONDS = 30.0
 _STORED_KEY_FAILURE_LIMIT = 2
+# 手动保存等待在途轮的上限：一轮含等待实时同步与保存，可能耗时一两分钟
+_SYNC_NOW_WAIT_SECONDS = 300.0
+# 近期成功窗口：窗口内手动保存直接复用最近一轮结果，避免重复保存
+_RECENT_SUCCESS_SKIP_SECONDS = 60.0
 
 
 def _wechat_running() -> bool:
@@ -97,6 +102,8 @@ class WechatAutosaveService:
         self._state = "idle"
         self._last_error = ""
         self._stored_key_failures = 0
+        self._last_success_at = 0.0
+        self._last_success_result: dict[str, Any] | None = None
 
     def get_state(self) -> dict[str, Any]:
         with self._mu:
@@ -148,14 +155,25 @@ class WechatAutosaveService:
             self._stop_event.wait(_INTERVAL_SECONDS)
 
     def sync_now(self) -> dict[str, Any]:
-        """手动触发一轮保存；与后台线程互斥，重入返回忙。"""
-        if not self._sync_lock.acquire(blocking=False):
+        """手动触发一轮保存；等待在途轮完成后执行，近期已成功则直接复用结果。
+
+        后台 tick 几乎持续保存（每 30s 起一轮、每轮耗时约一两分钟），
+        立即报"忙"会让用户误以为保存失败，因此这里等待在途轮结束再返回。
+        """
+        if not self._sync_lock.acquire(timeout=_SYNC_NOW_WAIT_SECONDS):
             return {
                 "status": -1,
                 "errmsg": "正在保存中，请稍候",
                 "state": self.get_state()["state"],
             }
         try:
+            if (
+                self._last_success_result is not None
+                and time.time() - self._last_success_at <= _RECENT_SUCCESS_SKIP_SECONDS
+            ):
+                result = dict(self._last_success_result)
+                result["state"] = self.get_state()["state"]
+                return result
             summary = self._run_once()
             result = dict(summary)
             result.setdefault("state", self.get_state()["state"])
@@ -246,13 +264,17 @@ class WechatAutosaveService:
             account,
             successful_count,
         )
-        return {
+        result = {
             "status": 0,
             "errmsg": "ok",
             "state": "up_to_date",
             "summary": manifest["summary"],
             "last_saved_at": manifest["last_saved_at"],
         }
+        # 供 sync_now 在近期成功窗口内复用（读写均在 _sync_lock 内，线程安全）
+        self._last_success_at = time.time()
+        self._last_success_result = dict(result)
+        return result
 
     def _acquire_key(self, context: dict[str, Any]) -> str:
         result = get_db_key_workflow(

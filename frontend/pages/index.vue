@@ -186,7 +186,8 @@ const toggleWechatEnabled = async (event) => {
 
 const syncNow = async () => {
   syncing.value = true
-  syncMessage.value = ''
+  syncMessageOk.value = true
+  syncMessage.value = '正在保存，通常一两分钟内完成，请稍候…'
   try {
     const resp = await triggerWechatSync()
     if (resp?.status === 0) {
