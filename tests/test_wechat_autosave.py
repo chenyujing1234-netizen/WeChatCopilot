@@ -205,3 +205,28 @@ def test_start_stop_thread(monkeypatch, isolated_data_dir):
         assert service.get_state()["state"] == "waiting_wechat"
     finally:
         service.stop()
+
+
+def test_tick_skipped_while_sync_lock_held(svc, monkeypatch):
+    """tick 与 sync_now 互斥：手动保存持锁期间，后台 tick 跳过保存。"""
+    monkeypatch.setattr(wechat_autosave, "_INTERVAL_SECONDS", 0.02)
+    monkeypatch.setattr(
+        wechat_autosave,
+        "get_account_keys_from_store",
+        mock.Mock(return_value={"db_key": "a" * 64}),
+    )
+    monkeypatch.setattr(wechat_autosave, "_acquire_decrypt_account_guards", mock.Mock(return_value=[]))
+    monkeypatch.setattr(wechat_autosave, "_release_decrypt_account_guards", mock.Mock())
+    decrypt = _patch_decrypt_ok(monkeypatch)
+    monkeypatch.setattr(wechat_autosave, "_persist_db_keys", mock.Mock(return_value=(True, [])))
+    monkeypatch.setattr(wechat_autosave, "get_db_key_workflow", mock.Mock())
+
+    svc._sync_lock.acquire()
+    svc.start()
+    try:
+        time.sleep(0.2)  # 覆盖约 10 个 tick 周期
+        assert decrypt.call_count == 0
+        assert svc.get_state()["state"] == "idle"
+    finally:
+        svc.stop()
+        svc._sync_lock.release()

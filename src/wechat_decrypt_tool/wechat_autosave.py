@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import os
 import threading
-import time
 from typing import Any
 
 from .app_paths import get_output_databases_dir
@@ -138,8 +137,11 @@ class WechatAutosaveService:
             try:
                 if not self._enabled():
                     self._set_state("disabled")
-                else:
-                    self._run_once()
+                elif self._sync_lock.acquire(blocking=False):
+                    try:
+                        self._run_once()
+                    finally:
+                        self._sync_lock.release()
             except Exception:
                 logger.exception("[wechat-autosave] tick failed")
                 self._set_state("error", "内部错误")
@@ -164,9 +166,9 @@ class WechatAutosaveService:
     def _run_once(self) -> dict[str, Any]:
         try:
             return self._save_pass()
-        except Exception as exc:
+        except Exception:
             logger.exception("[wechat-autosave] 保存失败")
-            self._set_state("error", str(exc))
+            self._set_state("error", "本轮保存未完成")
             # 对外错误不透出内部处理细节（隐藏解密）
             return {
                 "status": -1,
