@@ -22,6 +22,7 @@ from . import __version__ as APP_VERSION
 from .path_fix import PathFixRoute
 from .chat_realtime_autosync import CHAT_REALTIME_AUTOSYNC
 from .sns_realtime_autosync import SNS_REALTIME_AUTOSYNC
+from .wechat_autosave import WECHAT_AUTOSAVE
 from .routers.chat import router as _chat_router
 from .routers.chat_realtime_sse import router as _chat_realtime_sse_router
 from .routers.chat_contacts import router as _chat_contacts_router
@@ -302,6 +303,10 @@ async def _startup_background_jobs() -> None:
             "[sns.incremental-sync] status=error phase=service-start error_type=%s",
             type(exc).__name__,
         )
+    try:
+        WECHAT_AUTOSAVE.start()
+    except Exception:
+        logger.exception("Failed to start wechat autosave service")
 
 
 @app.on_event("shutdown")
@@ -310,6 +315,10 @@ async def _shutdown_wcdb_realtime() -> None:
     await stop_services()
     try:
         CHAT_REALTIME_AUTOSYNC.stop()
+    except Exception:
+        pass
+    try:
+        WECHAT_AUTOSAVE.stop()
     except Exception:
         pass
     try:
