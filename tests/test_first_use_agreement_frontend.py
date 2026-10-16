@@ -136,7 +136,6 @@ def test_notice_covers_version_login_and_hook_risks():
 
 def test_app_uses_a_route_aware_guard_with_a_hard_navigation_fallback():
     source = read_frontend("app.vue")
-    index = read_frontend("pages/index.vue")
 
     assert "const firstUseRouteResolved = ref(isAgreementRoute())" in source
     assert "await nextTick()" in source
@@ -145,7 +144,8 @@ def test_app_uses_a_route_aware_guard_with_a_hard_navigation_fallback():
     assert "直接打开使用须知" in source
     assert '<a :href="firstUseAgreementHref"' in source
     assert "window.location.replace(firstUseAgreementHref.value)" in source
-    assert "if (!isFirstUseAgreementAccepted()) return" in index
+    # 旧首页内联的首用守卫随 Task 6 移除：其守卫对象是同样被移除的启动自动跳转，
+    # 首页路由本身由全局中间件与 app.vue 的硬导航兜底共同守护。
 
 
 def test_inline_bootstrap_can_reach_and_accept_the_notice_without_nuxt_mounting():

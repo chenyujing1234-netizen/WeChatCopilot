@@ -60,4 +60,6 @@ def test_account_dependent_pages_share_the_no_account_guide():
 
     assert 'title="还没有可查看的微信数据"' in source
     assert 'secondary-label="暂时留在此页"' in source
-    assert "await navigateTo('/detection-result')" in source
+    # Task 6：无数据引导的主按钮改为前往上下文中心首页（检测/导入入口在首页内提供）。
+    assert 'primary-label="去上下文中心"' in source
+    assert "await navigateTo('/')" in source

@@ -28,9 +28,13 @@ class TestWcdbFallbackFrontend(unittest.TestCase):
 
     def test_homepage_can_scroll_below_wrapped_mobile_banner(self):
         home = (ROOT / "frontend" / "pages" / "index.vue").read_text(encoding="utf-8")
+        app = (ROOT / "frontend" / "app.vue").read_text(encoding="utf-8")
 
-        self.assertIn("overflow-auto", home)
-        self.assertIn("justify-start lg:justify-center", home)
+        # 上下文中心首页随内容自然增高（min-h-screen），滚动由 app.vue 壳层的
+        # overflow-auto 内容区提供；内容列横向受限居中，避免换行横幅遮挡。
+        self.assertIn("min-h-screen", home)
+        self.assertIn("mx-auto w-full max-w-[980px]", home)
+        self.assertIn("overflow-auto", app)
 
     def test_realtime_status_surfaces_native_probe_errors(self):
         store = (ROOT / "frontend" / "stores" / "chatRealtime.js").read_text(encoding="utf-8")
