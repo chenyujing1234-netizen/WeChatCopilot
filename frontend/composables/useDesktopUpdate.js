@@ -14,7 +14,7 @@ const isUpdaterSupported = () => {
   if (!api) return false;
 
   // If the bridge exposes a brand marker, ensure it's our Electron shell.
-  if (api.__brand && api.__brand !== "WeChatDataAnalysisDesktop") return false;
+  if (api.__brand && api.__brand !== "ContextBuddyDesktop") return false;
 
   // Require updater IPC to avoid showing update UI in the pure web build.
   return (
