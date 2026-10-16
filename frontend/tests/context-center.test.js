@@ -133,33 +133,18 @@ describe('上下文中心首页', () => {
     expect(w.findComponent({ name: 'WechatDetectionPanel' }).exists()).toBe(false)
   })
 
-  it('查看微信上下文以浮层打开，主界面保留且不发生导航', async () => {
+  it('查看微信上下文打开独立子窗口，主界面保留且不发生导航', async () => {
     const w = await mountHome()
-    await w.findAll('button').find(b => b.text() === '查看微信上下文').trigger('click')
-    await flushPromises()
-    expect(navigateToMock).not.toHaveBeenCalled()
-    // 主界面（微信卡片）仍在 DOM 中
-    expect(w.text()).toContain('微信数据')
-    // 浮层与 /chat iframe 出现
-    expect(w.find('.wechat-chat-overlay-card').exists()).toBe(true)
-    const frame = w.find('iframe')
-    expect(frame.exists()).toBe(true)
-    expect(frame.attributes('src')).toBe('/chat')
-  })
-
-  it('点击浮层背景或关闭按钮关闭微信上下文浮层', async () => {
-    const w = await mountHome()
-    await w.findAll('button').find(b => b.text() === '查看微信上下文').trigger('click')
-    await flushPromises()
-    await w.find('.wechat-chat-overlay-backdrop').trigger('click')
-    await flushPromises()
-    expect(w.find('.wechat-chat-overlay-card').exists()).toBe(false)
-
-    await w.findAll('button').find(b => b.text() === '查看微信上下文').trigger('click')
-    await flushPromises()
-    await w.findAll('button').find(b => b.text() === '关闭').trigger('click')
-    await flushPromises()
-    expect(w.find('.wechat-chat-overlay-card').exists()).toBe(false)
-    expect(w.find('iframe').exists()).toBe(false)
+    const openMock = vi.spyOn(window, 'open').mockReturnValue(null)
+    try {
+      await w.findAll('button').find(b => b.text() === '查看微信上下文').trigger('click')
+      await flushPromises()
+      expect(openMock).toHaveBeenCalledWith('/chat', '_blank')
+      expect(navigateToMock).not.toHaveBeenCalled()
+      // 主界面（微信卡片）仍在 DOM 中
+      expect(w.text()).toContain('微信数据')
+    } finally {
+      openMock.mockRestore()
+    }
   })
 })

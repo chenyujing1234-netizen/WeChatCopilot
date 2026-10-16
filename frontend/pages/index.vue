@@ -116,39 +116,6 @@
       </section>
     </div>
 
-    <!-- 微信上下文浮层：主界面保留，/chat 在浮层内独立运行（路由与账号切换不受影响），
-         v-if 关闭即卸载 iframe，页面资源随之彻底释放。 -->
-    <div
-      v-if="chatOpen"
-      class="fixed inset-0 z-[170] flex items-center justify-center p-3 sm:p-6"
-    >
-      <div
-        class="wechat-chat-overlay-backdrop absolute inset-0 bg-[rgba(14,22,18,0.44)]"
-        @click="chatOpen = false"
-      ></div>
-      <div
-        class="wechat-chat-overlay-card relative flex h-full w-full max-w-[1400px] flex-col overflow-hidden rounded-2xl border border-[#DDEBE0] bg-white shadow-[0_24px_80px_-24px_rgba(0,0,0,0.45)]"
-      >
-        <div
-          class="flex shrink-0 items-center justify-between border-b border-[var(--app-border-soft,#e8e8e8)] bg-[var(--app-surface-bg,#fff)] px-4 py-2.5"
-        >
-          <span class="text-[14px] font-semibold text-[var(--app-text-primary,#000000e6)]">微信上下文</span>
-          <button
-            type="button"
-            class="rounded-[6px] px-3 py-1 text-[12px] text-[var(--app-text-secondary,#5f5f5f)] transition hover:bg-[var(--app-neutral-btn-hover,#f2f2f2)]"
-            @click="chatOpen = false"
-          >
-            关闭
-          </button>
-        </div>
-        <iframe
-          src="/chat"
-          class="min-h-0 w-full flex-1 border-0"
-          title="微信上下文"
-        ></iframe>
-      </div>
-    </div>
-
     <!-- 账号检测浮层：覆盖在主界面上运行检测流程，关闭即回到上下文中心。
          z-[170] 必须低于 GuideDialog 的 z-180，保证面板内的登录/目录提示弹窗盖在浮层之上。 -->
     <div
@@ -261,9 +228,9 @@ const syncNow = async () => {
   }
 }
 
-// 查看微信上下文以浮层打开（iframe 独立运行 /chat），主界面保持挂载不跳转
-const chatOpen = ref(false)
-const viewWechatContext = () => { chatOpen.value = true }
+// 查看微信上下文以独立子窗口打开（桌面端 window.open → 独立 BrowserWindow），
+// 与主界面非模态并存；浏览器开发环境回退为新标签页。
+const viewWechatContext = () => { window.open('/chat', '_blank') }
 
 const goImport = async () => { await navigateTo('/import') }
 
@@ -316,16 +283,6 @@ onMounted(() => { void reload() })
 </script>
 
 <style scoped>
-/* 微信上下文浮层卡片暗色主题（与检测浮层一致） */
-html[data-theme='dark'] .wechat-chat-overlay-backdrop {
-  background: rgba(0, 0, 0, 0.58);
-}
-
-html[data-theme='dark'] .wechat-chat-overlay-card {
-  border-color: var(--setup-border);
-  background: var(--app-surface-bg);
-}
-
 /* 检测浮层卡片暗色主题（背景/描边变量与 GuideDialog 面板一致） */
 html[data-theme='dark'] .wechat-detection-overlay-backdrop {
   background: rgba(0, 0, 0, 0.58);

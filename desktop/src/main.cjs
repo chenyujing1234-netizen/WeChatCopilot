@@ -2548,6 +2548,34 @@ function createMainWindow() {
     if (mainWindow === win) mainWindow = null;
   });
 
+  // 前端页面（如微信上下文 /chat）通过 window.open 以独立子窗口打开：
+  // 与主窗口非模态并存，主界面保持可操作，两窗口可并排使用。
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    let uiOrigin = "";
+    try {
+      uiOrigin = new URL(getDesktopUiUrl()).origin;
+    } catch {}
+    if (uiOrigin && typeof url === "string" && url.startsWith(`${uiOrigin}/`)) {
+      return {
+        action: "allow",
+        overrideBrowserWindowOptions: {
+          width: 1080,
+          height: 720,
+          minWidth: 720,
+          minHeight: 520,
+          backgroundColor: "#FFFFFF",
+          webPreferences: {
+            preload: path.join(__dirname, "preload.cjs"),
+            contextIsolation: true,
+            nodeIntegration: false,
+            devTools: true,
+          },
+        },
+      };
+    }
+    return { action: "deny" };
+  });
+
   setupRendererConsoleLogging(win);
   setupRendererLifecycleLogging(win);
 
