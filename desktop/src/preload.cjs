@@ -62,7 +62,7 @@ if (typeof window !== "undefined") {
 
 contextBridge.exposeInMainWorld("wechatDesktop", {
   // Marker used by the frontend to distinguish the Electron desktop shell from the pure web build.
-  __brand: "WeChatDataAnalysisDesktop",
+  __brand: "ContextBuddyDesktop",
   platform: process.platform,
   takeAiNavigation: () => ipcRenderer.invoke('ai:takeNavigation'),
   aiDiagnosticFallback: (entries) => ipcRenderer.invoke('ai:diagnosticFallback', entries),

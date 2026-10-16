@@ -232,7 +232,7 @@ onMounted(async () => {
   const isElectron = /electron/i.test(String(navigator.userAgent || ''))
   const api = window?.wechatDesktop
   isDesktop.value = isElectron && !!api
-  const brandOk = !api?.__brand || api.__brand === 'WeChatDataAnalysisDesktop'
+  const brandOk = !api?.__brand || api.__brand === 'ContextBuddyDesktop'
   isDesktopUpdater.value =
     isDesktop.value &&
     brandOk &&

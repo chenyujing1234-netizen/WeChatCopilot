@@ -55,8 +55,8 @@ from .routers.system import router as _system_router
 from .routers.cdn import router as _cdn_router
 
 app = FastAPI(
-    title="微信数据库解密工具",
-    description="现代化的微信数据库解密工具，支持微信信息检测和数据库解密功能",
+    title="ContextBuddy",
+    description="本地上下文收集与保存工具，自动保存微信等上下文数据",
     version=APP_VERSION,
 )
 
