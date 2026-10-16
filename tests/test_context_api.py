@@ -159,6 +159,34 @@ def test_settings_data_dir_ignored_for_other_sources(client, quiet_autosave_serv
     assert "data_dir" not in resp.json()["settings"]["browser_history"]
 
 
+def test_settings_archive_content_defaults_to_structured(client):
+    resp = client.get("/api/context/settings")
+    assert resp.json()["settings"]["wechat"]["archive_content"] == "structured"
+
+    resp = client.get("/api/context/sources")
+    wechat = [s for s in resp.json()["sources"] if s["source_id"] == "wechat"][0]
+    assert wechat["archive_content"] == "structured"
+
+
+def test_settings_archive_content_roundtrip(client):
+    resp = client.put("/api/context/settings", json={"wechat": {"archive_content": "databases"}})
+
+    assert resp.status_code == 200
+    assert resp.json()["settings"]["wechat"]["archive_content"] == "databases"
+
+    resp = client.get("/api/context/sources")
+    wechat = [s for s in resp.json()["sources"] if s["source_id"] == "wechat"][0]
+    assert wechat["archive_content"] == "databases"
+
+
+def test_settings_reject_invalid_archive_content(client):
+    resp = client.put("/api/context/settings", json={"wechat": {"archive_content": "resources"}})
+
+    assert resp.status_code == 400
+    resp = client.get("/api/context/settings")
+    assert resp.json()["settings"]["wechat"]["archive_content"] == "structured"
+
+
 def test_local_only_blocks_remote_client():
     app = FastAPI()
     app.include_router(context_router.router)

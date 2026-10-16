@@ -42,6 +42,7 @@ router = APIRouter(prefix="/api/context", dependencies=[Depends(local_only)])
 class SourceSettingUpdate(BaseModel):
     enabled: Optional[bool] = None
     data_dir: Optional[str] = None
+    archive_content: Optional[str] = None
 
 
 class ContextSettingsUpdate(BaseModel):
@@ -126,6 +127,10 @@ async def get_context_settings():
 async def update_context_settings(payload: ContextSettingsUpdate):
     updates = payload.model_dump(exclude_none=True)
     wechat_update = updates.get("wechat") or {}
+    if "archive_content" in wechat_update:
+        value = str(wechat_update["archive_content"] or "").strip()
+        if value not in {"structured", "databases"}:
+            raise HTTPException(400, "归档内容仅支持：结构化的数据 / 数据库文件")
     if "data_dir" in wechat_update:
         await _apply_wechat_data_dir(str(wechat_update["data_dir"] or "").strip())
         updates["wechat"] = {

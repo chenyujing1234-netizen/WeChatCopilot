@@ -21,7 +21,7 @@ logger = get_logger(__name__)
 _SETTINGS_LOCK = threading.Lock()
 
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "wechat": {"enabled": True, "data_dir": ""},
+    "wechat": {"enabled": True, "data_dir": "", "archive_content": "structured"},
     "browser_history": {"enabled": False},
     "computer_activity": {"enabled": False},
     "mobile_upload": {"enabled": False},
@@ -68,8 +68,10 @@ def save_settings(settings: dict[str, Any]) -> dict[str, Any]:
     for source_id, overrides in (settings or {}).items():
         if source_id not in normalized or not isinstance(overrides, dict):
             continue
-        # 各源仅允许更新自己的设置键：开关通用，保存位置仅微信数据源支持
-        allowed_keys = {"enabled"} | ({"data_dir"} if source_id == "wechat" else set())
+        # 各源仅允许更新自己的设置键：开关通用，保存位置与归档内容仅微信数据源支持
+        allowed_keys = {"enabled"} | (
+            {"data_dir", "archive_content"} if source_id == "wechat" else set()
+        )
         normalized[source_id].update(
             {key: value for key, value in overrides.items() if key in allowed_keys}
         )
@@ -193,6 +195,9 @@ class WechatContextSource:
             "planned": False,
             "data_dir": str(settings.get("wechat", {}).get("data_dir") or ""),
             "data_dir_effective": str(get_output_databases_dir()),
+            "archive_content": str(
+                settings.get("wechat", {}).get("archive_content") or "structured"
+            ),
         }
 
     def start(self) -> None:

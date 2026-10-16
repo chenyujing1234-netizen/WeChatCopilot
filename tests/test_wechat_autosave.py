@@ -1,4 +1,5 @@
 """wechat_autosave：微信上下文自动保存服务的状态机与保存链路。"""
+import json
 import threading
 import time
 from unittest import mock
@@ -16,6 +17,35 @@ def isolated_data_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
+def _patch_structured_generation(monkeypatch, *, raises=None):
+    """mock 归档导出的结构化生成：默认在暂存目录写入最小 index/会话文件。
+
+    保存链路会在生成成功后把暂存目录整体替换为账号目录下的 structured_data。
+    """
+    from wechat_decrypt_tool.routers import account_archive_export
+
+    def fake_generate(*, job, account_dir, staging_dir, account_prefix):
+        if raises is not None:
+            raise raises
+        data_dir = staging_dir / "structured_data"
+        chat_dir = data_dir / "chat"
+        chat_dir.mkdir(parents=True, exist_ok=True)
+        chat_file = chat_dir / "0001_friend.json"
+        chat_file.write_text("{}", encoding="utf-8")
+        index_file = data_dir / "index.json"
+        index_file.write_text(
+            json.dumps(
+                {"dataTypes": {"chatMessages": {"conversationCount": 1, "messageCount": 5}}}
+            ),
+            encoding="utf-8",
+        )
+        return [chat_file, index_file]
+
+    gen = mock.Mock(side_effect=fake_generate)
+    monkeypatch.setattr(account_archive_export, "_generate_structured_chat_data", gen)
+    return gen
+
+
 @pytest.fixture
 def svc(monkeypatch):
     monkeypatch.setattr(wechat_autosave, "_wechat_running", mock.Mock(return_value=True))
@@ -30,6 +60,7 @@ def svc(monkeypatch):
     )
     service = wechat_autosave.WechatAutosaveService()
     monkeypatch.setattr(wechat_autosave.CHAT_REALTIME_AUTOSYNC, "start", mock.Mock())
+    _patch_structured_generation(monkeypatch)
     return service
 
 
@@ -293,3 +324,62 @@ def test_tick_skipped_while_sync_lock_held(svc, monkeypatch):
     finally:
         svc.stop()
         svc._sync_lock.release()
+
+
+def test_run_once_generates_structured_by_default(svc, monkeypatch):
+    """归档内容默认“结构化的数据”：保存成功后生成到账号目录并整体替换。"""
+    _patch_save_dependencies(monkeypatch)
+    gen = _patch_structured_generation(monkeypatch)
+
+    result = svc._run_once()
+
+    assert result["status"] == 0
+    assert result["archive_content"] == "structured"
+    assert result["structured"]["ok"] is True
+    assert result["structured"]["conversations"] == 1
+    assert result["structured"]["messages"] == 5
+    assert gen.call_count == 1
+    kwargs = gen.call_args.kwargs
+    assert kwargs["account_dir"].name == "wxid_test"
+    assert kwargs["staging_dir"].name == "structured_data.tmp"
+
+    from wechat_decrypt_tool.app_paths import get_output_databases_dir
+
+    structured_dir = get_output_databases_dir() / "wxid_test" / "structured_data"
+    assert (structured_dir / "index.json").exists()
+    assert (structured_dir / "chat" / "0001_friend.json").exists()
+    # 暂存目录已被替换，不再残留
+    assert not (structured_dir.parent / "structured_data.tmp").exists()
+
+    manifest = context_registry.read_manifest("wechat")
+    assert manifest["summary"]["archive_content"] == "structured"
+    assert manifest["summary"]["structured"]["ok"] is True
+
+
+def test_run_once_skips_structured_when_databases(svc, monkeypatch):
+    """归档内容为“数据库文件”时不生成结构化数据。"""
+    context_registry.save_settings({"wechat": {"archive_content": "databases"}})
+    _patch_save_dependencies(monkeypatch)
+    gen = _patch_structured_generation(monkeypatch)
+
+    result = svc._run_once()
+
+    assert result["status"] == 0
+    assert result["archive_content"] == "databases"
+    assert "structured" not in result
+    assert gen.call_count == 0
+    manifest = context_registry.read_manifest("wechat")
+    assert manifest["summary"]["archive_content"] == "databases"
+    assert "structured" not in manifest["summary"]
+
+
+def test_structured_failure_does_not_fail_round(svc, monkeypatch):
+    """结构化数据生成失败只记日志，不影响本轮保存结果。"""
+    _patch_save_dependencies(monkeypatch)
+    _patch_structured_generation(monkeypatch, raises=RuntimeError("boom"))
+
+    result = svc._run_once()
+
+    assert result["status"] == 0
+    assert result["structured"]["ok"] is False
+    assert svc.get_state()["state"] == "up_to_date"

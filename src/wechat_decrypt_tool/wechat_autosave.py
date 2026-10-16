@@ -11,7 +11,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import threading
 import time
 from typing import Any
@@ -249,13 +251,27 @@ class WechatAutosaveService:
         except Exception:
             logger.exception("[wechat-autosave] 启动实时同步失败")
 
+        # 归档内容：structured（默认）每轮保存后生成结构化的聊天 JSON/TXT；
+        # databases 仅保存数据库文件（当前行为）。数据库文件是内部处理必需的
+        # 中间数据，两种选择下都会保留在账号目录中。
+        archive_content = str(
+            load_settings().get("wechat", {}).get("archive_content") or "structured"
+        )
+        structured_summary: dict[str, Any] | None = None
+        if archive_content == "structured":
+            structured_summary = self._generate_structured_data(account)
+
+        summary = {
+            "accounts": 1,
+            "account": account,
+            "successful_databases": successful_count,
+            "archive_content": archive_content,
+        }
+        if structured_summary is not None:
+            summary["structured"] = structured_summary
         manifest = write_manifest(
             "wechat",
-            summary={
-                "accounts": 1,
-                "account": account,
-                "successful_databases": successful_count,
-            },
+            summary=summary,
             data_ref=str(get_output_databases_dir()),
         )
         self._set_state("up_to_date")
@@ -270,11 +286,74 @@ class WechatAutosaveService:
             "state": "up_to_date",
             "summary": manifest["summary"],
             "last_saved_at": manifest["last_saved_at"],
+            "archive_content": archive_content,
         }
+        if structured_summary is not None:
+            result["structured"] = structured_summary
         # 供 sync_now 在近期成功窗口内复用（读写均在 _sync_lock 内，线程安全）
         self._last_success_at = time.time()
         self._last_success_result = dict(result)
         return result
+
+    def _generate_structured_data(self, account: str) -> dict[str, Any]:
+        """按“结构化的数据”归档内容生成聊天 JSON/TXT 到账号目录；失败不影响本轮保存。
+
+        复用归档导出的结构化生成逻辑：先写入账号目录下的临时目录，
+        成功后整体替换 structured_data，中途失败时旧的结构化数据仍然可用。
+        """
+        try:
+            from .routers.account_archive_export import (
+                AccountArchiveExportJob,
+                _generate_structured_chat_data,
+                _safe_file_name,
+            )
+
+            account_dir = get_output_databases_dir() / account
+            staging_root = account_dir / "structured_data.tmp"
+            if staging_root.exists():
+                shutil.rmtree(staging_root, ignore_errors=True)
+            staging_root.mkdir(parents=True, exist_ok=True)
+            job = AccountArchiveExportJob(
+                export_id=f"wechat-autosave:{account}", account=account
+            )
+            files = _generate_structured_chat_data(
+                job=job,
+                account_dir=account_dir,
+                staging_dir=staging_root,
+                account_prefix=_safe_file_name(account, "account"),
+            )
+            # 生成器会在暂存目录下创建 structured_data/，整体替换到账号目录
+            final_dir = account_dir / "structured_data"
+            if final_dir.exists():
+                shutil.rmtree(final_dir, ignore_errors=True)
+            (staging_root / "structured_data").rename(final_dir)
+            shutil.rmtree(staging_root, ignore_errors=True)
+            summary: dict[str, Any] = {"ok": True, "files": len(files)}
+            try:
+                index = json.loads(
+                    (final_dir / "index.json").read_text(encoding="utf-8")
+                )
+                chat = index.get("dataTypes", {}).get("chatMessages", {})
+                summary["conversations"] = int(chat.get("conversationCount") or 0)
+                summary["messages"] = int(chat.get("messageCount") or 0)
+            except Exception:
+                logger.exception(
+                    "[wechat-autosave] 结构化数据索引读取失败 account=%s", account
+                )
+            logger.info(
+                "[wechat-autosave] structured generated account=%s files=%s "
+                "conversations=%s messages=%s",
+                account,
+                len(files),
+                summary.get("conversations", 0),
+                summary.get("messages", 0),
+            )
+            return summary
+        except Exception:
+            logger.exception(
+                "[wechat-autosave] 结构化的数据生成失败 account=%s", account
+            )
+            return {"ok": False}
 
     def _acquire_key(self, context: dict[str, Any]) -> str:
         result = get_db_key_workflow(

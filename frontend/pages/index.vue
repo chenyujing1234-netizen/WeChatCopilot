@@ -72,6 +72,20 @@
           </button>
         </div>
 
+        <div class="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-[10px] bg-[#fafafa] px-4 py-2.5 text-[12px]">
+          <span class="shrink-0 text-[#8a8a8a]" title="每轮自动保存产出的数据类型">归档内容</span>
+          <select
+            class="shrink-0 cursor-pointer rounded-[6px] border border-[#e4e4e4] bg-white px-2 py-1 font-medium text-[#222] outline-none transition hover:border-[#07c160] disabled:cursor-not-allowed disabled:opacity-60"
+            :disabled="changingArchiveContent"
+            :value="archiveContent"
+            @change="changeArchiveContent"
+          >
+            <option value="structured">结构化的数据</option>
+            <option value="databases">数据库文件</option>
+          </select>
+          <span class="min-w-0 flex-1 text-[#8a8a8a]">{{ archiveContentHint }}</span>
+        </div>
+
         <div class="mt-5 flex flex-wrap items-center gap-3">
           <button
             type="button"
@@ -214,7 +228,13 @@ const syncNow = async () => {
     const resp = await triggerWechatSync()
     if (resp?.status === 0) {
       syncMessageOk.value = true
-      syncMessage.value = '本轮保存已完成。'
+      if (resp?.structured?.ok) {
+        syncMessage.value = '本轮保存已完成，结构化的数据已更新。'
+      } else if (resp?.structured) {
+        syncMessage.value = '本轮保存已完成，结构化的数据未更新，下轮保存会自动重试。'
+      } else {
+        syncMessage.value = '本轮保存已完成。'
+      }
     } else {
       syncMessageOk.value = false
       syncMessage.value = resp?.errmsg || '本轮保存未完成，稍后会自动重试。'
@@ -271,6 +291,37 @@ const changeDataDir = async () => {
 }
 
 const resetDataDir = () => applyDataDir('')
+
+// 归档内容：结构化的数据（默认）或数据库文件，下一轮保存起生效；
+// 数据库文件是内部处理必需的数据，两种选择下都会保留在账号目录中
+const changingArchiveContent = ref(false)
+const archiveContent = computed(() => wechatSource.value?.archive_content || 'structured')
+const ARCHIVE_CONTENT_HINTS = {
+  structured: '每轮保存后把聊天记录生成为 JSON 与 TXT，数据库文件作为内部数据保留',
+  databases: '仅保存数据库文件'
+}
+const archiveContentHint = computed(() => ARCHIVE_CONTENT_HINTS[archiveContent.value] || ARCHIVE_CONTENT_HINTS.structured)
+
+const changeArchiveContent = async (event) => {
+  const value = event?.target?.value || 'structured'
+  if (value === archiveContent.value || changingArchiveContent.value) return
+  changingArchiveContent.value = true
+  try {
+    await updateContextSettings({ wechat: { archive_content: value } })
+    await reload()
+    syncMessageOk.value = true
+    syncMessage.value = value === 'structured'
+      ? '归档内容已切换为结构化的数据，下一轮保存起生效。'
+      : '归档内容已切换为数据库文件，下一轮保存起生效。'
+  } catch (e) {
+    syncMessageOk.value = false
+    syncMessage.value = e?.message || '更新归档内容失败'
+    // 失败时把选择框恢复为当前生效值
+    if (event?.target) event.target.value = archiveContent.value
+  } finally {
+    changingArchiveContent.value = false
+  }
+}
 
 // 账号检测在首页浮层中运行，主界面保持挂载不跳转
 const detectionOpen = ref(false)
