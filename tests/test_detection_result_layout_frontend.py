@@ -5,7 +5,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_detection_summary_uses_roomy_desktop_layout():
-    source = (ROOT / "frontend" / "pages" / "detection-result.vue").read_text(encoding="utf-8")
+    source = (ROOT / "frontend" / "components" / "WechatDetectionPanel.vue").read_text(encoding="utf-8")
 
     assert 'lg:grid-cols-[minmax(0,0.82fr)_minmax(0,1.18fr)]' in source
     assert 'data-testid="detection-summary"' in source

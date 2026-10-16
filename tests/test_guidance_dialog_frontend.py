@@ -19,7 +19,7 @@ def test_guide_dialog_is_accessible_and_reusable():
 
 
 def test_detection_guides_cover_login_and_both_directory_types():
-    source = read_frontend("pages/detection-result.vue")
+    source = read_frontend("components/WechatDetectionPanel.vue")
 
     assert "title: '请先登录电脑版微信'" in source
     assert "title: '请选择微信数据根目录'" in source

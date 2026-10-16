@@ -9,6 +9,7 @@ const api = {
   triggerWechatSync: vi.fn()
 }
 let wrapper
+let navigateToMock
 
 const sourcesPayload = () => ({
   status: 'ok',
@@ -22,8 +23,9 @@ const sourcesPayload = () => ({
 })
 
 beforeEach(() => {
+  navigateToMock = vi.fn()
   vi.stubGlobal('useApi', () => api)
-  vi.stubGlobal('navigateTo', vi.fn())
+  vi.stubGlobal('navigateTo', navigateToMock)
   api.getContextSources.mockReset().mockImplementation(async () => sourcesPayload())
   api.getContextSettings.mockReset().mockResolvedValue({ status: 'ok', settings: { wechat: { enabled: true } } })
   api.updateContextSettings.mockReset().mockResolvedValue({ status: 'ok', settings: { wechat: { enabled: false } } })
@@ -33,7 +35,7 @@ beforeEach(() => {
 afterEach(() => { wrapper?.unmount(); vi.unstubAllGlobals() })
 
 const mountHome = async () => {
-  wrapper = mount(ContextHome, { global: { stubs: { GlobalExportDialog: true } } })
+  wrapper = mount(ContextHome, { global: { stubs: { GlobalExportDialog: true, WechatDetectionPanel: true } } })
   await flushPromises()
   return wrapper
 }
@@ -70,5 +72,27 @@ describe('上下文中心首页', () => {
     const w = await mountHome()
     expect(w.text()).not.toContain('解密')
     expect(w.text()).not.toContain('密钥')
+  })
+
+  it('账号检测以浮层打开，主界面保留且不发生导航', async () => {
+    const w = await mountHome()
+    await w.findAll('a').find(a => a.text() === '账号检测').trigger('click')
+    await flushPromises()
+    expect(navigateToMock).not.toHaveBeenCalled()
+    // 主界面（微信卡片）仍在 DOM 中
+    expect(w.text()).toContain('微信数据')
+    // 浮层容器与检测面板出现
+    expect(w.find('.wechat-detection-overlay-card').exists()).toBe(true)
+    expect(w.findComponent({ name: 'WechatDetectionPanel' }).exists()).toBe(true)
+  })
+
+  it('点击浮层背景关闭账号检测浮层', async () => {
+    const w = await mountHome()
+    await w.findAll('a').find(a => a.text() === '账号检测').trigger('click')
+    await flushPromises()
+    await w.find('.wechat-detection-overlay-backdrop').trigger('click')
+    await flushPromises()
+    expect(w.find('.wechat-detection-overlay-card').exists()).toBe(false)
+    expect(w.findComponent({ name: 'WechatDetectionPanel' }).exists()).toBe(false)
   })
 })

@@ -94,6 +94,23 @@
       </section>
     </div>
 
+    <!-- 账号检测浮层：覆盖在主界面上运行检测流程，关闭即回到上下文中心。
+         z-[170] 必须低于 GuideDialog 的 z-180，保证面板内的登录/目录提示弹窗盖在浮层之上。 -->
+    <div
+      v-if="detectionOpen"
+      class="fixed inset-0 z-[170] flex items-center justify-center p-3 sm:p-6"
+    >
+      <div
+        class="wechat-detection-overlay-backdrop absolute inset-0 bg-[rgba(14,22,18,0.44)]"
+        @click="detectionOpen = false"
+      ></div>
+      <div
+        class="wechat-detection-overlay-card relative max-h-[88vh] w-full max-w-6xl overflow-y-auto rounded-2xl border border-[#DDEBE0] bg-[#F6FCF8] shadow-[0_24px_80px_-24px_rgba(0,0,0,0.45)]"
+      >
+        <WechatDetectionPanel @close="detectionOpen = false" />
+      </div>
+    </div>
+
     <GlobalExportDialog :open="exportDialogOpen" @close="closeExportDialog" />
   </div>
 </template>
@@ -190,10 +207,25 @@ const syncNow = async () => {
 
 const viewWechatContext = async () => { await navigateTo('/chat') }
 const goImport = async () => { await navigateTo('/import') }
-const goDetection = async () => { await navigateTo('/detection-result') }
+
+// 账号检测在首页浮层中运行，主界面保持挂载不跳转
+const detectionOpen = ref(false)
+const goDetection = () => { detectionOpen.value = true }
 
 const openExportDialog = () => { exportDialogOpen.value = true }
 const closeExportDialog = () => { exportDialogOpen.value = false }
 
 onMounted(() => { void reload() })
 </script>
+
+<style scoped>
+/* 检测浮层卡片暗色主题（背景/描边变量与 GuideDialog 面板一致） */
+html[data-theme='dark'] .wechat-detection-overlay-backdrop {
+  background: rgba(0, 0, 0, 0.58);
+}
+
+html[data-theme='dark'] .wechat-detection-overlay-card {
+  border-color: var(--setup-border);
+  background: var(--app-surface-bg);
+}
+</style>

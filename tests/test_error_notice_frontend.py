@@ -85,7 +85,7 @@ class ErrorNoticeFrontendTest(unittest.TestCase):
         expected = {
             "pages/decrypt.vue": [':message="error"', ':message="warning"'],
             "pages/import.vue": [':message="importError"'],
-            "pages/detection-result.vue": [':message="detectionResult.error"'],
+            "components/WechatDetectionPanel.vue": [':message="detectionResult.error"'],
             "pages/favorites.vue": [':message="error"'],
             "pages/contacts.vue": [':message="friendVerificationError"'],
             "components/BizMessages.vue": [':message="accountsError"', ':message="messagesError"'],
