@@ -130,7 +130,7 @@ def test_classify_with_llm(tmp_path: Path) -> None:
         call_llm=fake_call,
         batch_size=20,
         concurrency=2,
-        progress_cb=lambda d, t, f: progress.append((d, t, f)),
+        progress_cb=lambda d, t, f, chunk: progress.append((d, t, f, chunk)),
     )
     # 第一条：LLM 指向“喜乐”
     assert results[0].candidate is not None and results[0].candidate.rel_display == "喜乐"
@@ -141,7 +141,11 @@ def test_classify_with_llm(tmp_path: Path) -> None:
     # 第三条：LLM 给了无效目录 -> 不采纳
     assert results[2].candidate is None
     assert "无效目录" in results[2].reason
-    assert progress and progress[-1] == (1, 1, 0)  # 1 批完成、0 失败
+    assert progress and progress[-1][:3] == (1, 1, 0)  # 1 批完成、0 失败
+    # chunk 只含本批发给 LLM 的 2 条消息（系统附件不在批内）
+    chunk = progress[-1][3]
+    assert len(chunk) == 2
+    assert {r.message.content for r in chunk} == {"喜乐今天KET考试考得不错", "随便聊聊天气"}
 
 
 def test_classify_with_llm_cancel(tmp_path: Path) -> None:
@@ -177,11 +181,12 @@ def test_classify_with_llm_retry_then_fail(tmp_path: Path) -> None:
         candidates,
         call_llm=bad_call,
         concurrency=1,
-        progress_cb=lambda d, t, f: progress.append((d, t, f)),
+        progress_cb=lambda d, t, f, chunk: progress.append((d, t, f, chunk)),
     )
     assert results[0].candidate is None
     assert results[0].reason.startswith("LLM调用失败")
-    assert progress and progress[-1] == (1, 1, 1)  # 重试耗尽的批计入失败数
+    assert progress and progress[-1][:3] == (1, 1, 1)  # 重试耗尽的批计入失败数
+    assert len(progress[-1][3]) == 1  # 失败批的结果也通过 chunk 传出（供实时显示）
     assert "LLM 调用失败 1 条" in core.summarize(results)
 
 

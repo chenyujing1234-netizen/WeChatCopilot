@@ -54,12 +54,14 @@ class ChatSorterApp(tk.Tk):
         self.geometry("1180x780")
         self.minsize(960, 620)
 
-        self.assignments: list[dict] = []  # [{"result": ClassifyResult, "target": CandidateDir|None}]
+        self.assignments: list[dict] = []  # [{"message", "result", "target"}]
         self.candidates: list[core.CandidateDir] = []
         self.cand_by_display: dict[str, core.CandidateDir] = {}
         self._queue: queue.Queue = queue.Queue()
         self._cancel_event: threading.Event | None = None  # 分析运行中的取消信号
         self._analysis_started: float = 0.0  # 本轮分析开始时刻（monotonic），用于显示已用秒数
+        self._msg_index: dict[int, int] = {}  # id(消息) -> 行号，用于把批次结果映射回表格行
+        self._noise_count = 0  # 系统/附件消息数（分析开始即已知，无需等 LLM）
         cfg = load_llm_config()
 
         self._build_ui(cfg)
@@ -143,6 +145,7 @@ class ChatSorterApp(tk.Tk):
             self.tree.column(col, width=width, anchor=anchor, stretch=(col == "preview"))
         self.tree.tag_configure("noise", foreground="#888888")
         self.tree.tag_configure("unmatched", foreground="#b06000")
+        self.tree.tag_configure("pending", foreground="#7a7aa0")  # 分析中、尚未出结果的行
         self.tree.bind("<Double-1>", self._show_detail)
 
         tree_frame = ttk.Frame(self)
@@ -222,6 +225,8 @@ class ChatSorterApp(tk.Tk):
         try:
             messages = core.parse_chat_txt(cfg["source"])
             candidates = core.scan_candidate_dirs(cfg["root"], max_depth=cfg.get("max_depth"))
+            # 解析完成即预建表格：每完成一批就实时刷新对应行，不用等全部跑完
+            self._queue.put(("start", messages, candidates))
 
             def call_llm(llm_messages: list[dict]) -> str:
                 return core.openai_chat_call(
@@ -234,69 +239,106 @@ class ChatSorterApp(tk.Tk):
                 call_llm=call_llm,
                 batch_size=cfg["batch_size"],
                 concurrency=cfg["concurrency"],
-                progress_cb=lambda done, total, failed: self._queue.put(
-                    ("progress", done, total, failed)
+                progress_cb=lambda done, total, failed, chunk: self._queue.put(
+                    ("progress", done, total, failed, chunk)
                 ),
                 cancel_event=self._cancel_event,
             )
-            self._queue.put(("done", results, candidates, ""))
+            self._queue.put(("done", results))
         except Exception as exc:
-            self._queue.put(("error", None, None, str(exc)))
+            self._queue.put(("error", str(exc)))
 
     def _poll_queue(self) -> None:
         try:
             while True:
                 item = self._queue.get_nowait()
                 kind = item[0]
-                if kind == "progress":
-                    _, done, total, failed = item
-                    elapsed = max(0, int(time.monotonic() - self._analysis_started))
-                    extra = f"（{failed} 失败）" if failed else ""
-                    self.status_var.set(
-                        f"LLM 分类中：已完成 {done}/{total} 批{extra} · 已用 {elapsed} 秒…"
-                    )
+                if kind == "start":
+                    self._on_analysis_start(item[1], item[2])
+                elif kind == "progress":
+                    self._on_batch_progress(item[1], item[2], item[3], item[4])
                 elif kind == "done":
-                    self._on_analysis_done(item[1], item[2])
+                    self._on_analysis_done(item[1])
                 else:
-                    self._on_analysis_failed(item[3])
+                    self._on_analysis_failed(item[1])
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)
 
-    def _on_analysis_failed(self, error: str) -> None:
-        self._cancel_event = None
-        self.analyze_btn.configure(text="分 析", command=self._start_analysis, state="normal")
-        self.status_var.set("分析失败，请检查路径与 API 配置后重试。")
-        messagebox.showerror("分析失败", error)
-
-    def _on_analysis_done(self, results, candidates) -> None:
-        self._cancel_event = None
-        self.analyze_btn.configure(text="分 析", command=self._start_analysis)
+    def _on_analysis_start(self, messages, candidates) -> None:
+        """解析完成后预建全部行：系统/附件行直接定稿，其余显示“分析中…”。"""
         self.candidates = candidates
         self.cand_by_display = {core.display_rel(c): c for c in candidates}
-        self.assignments = [{"result": r, "target": r.candidate} for r in results]
+        self.assignments = [{"message": m, "result": None, "target": None} for m in messages]
+        self._msg_index = {id(m): i for i, m in enumerate(messages)}
+        self._noise_count = sum(1 for m in messages if core.is_noise_content(m.content))
 
         self.tree.delete(*self.tree.get_children())
-        for i, item in enumerate(self.assignments, start=1):
-            res = item["result"]
-            preview = res.message.content.replace("\\n", " ")
+        for i, item in enumerate(self.assignments):
+            msg = item["message"]
+            preview = msg.content.replace("\\n", " ")
             if len(preview) > 70:
                 preview = preview[:70] + "…"
-            target = core.display_rel(item["target"]) if item["target"] else UNCLASSIFIED
-            if core.is_noise_content(res.message.content):
+            if core.is_noise_content(msg.content):
+                values = (i + 1, msg.time_str, preview, UNCLASSIFIED, "系统/附件消息，自动跳过")
                 tag = "noise"
-            elif item["target"]:
-                tag = ""
             else:
-                tag = "unmatched"
-            self.tree.insert(
-                "", "end", iid=str(i - 1),
-                values=(i, res.message.time_str, preview, target, res.reason),
-                tags=(tag,),
-            )
+                values = (i + 1, msg.time_str, preview, "分析中…", "")
+                tag = "pending"
+            self.tree.insert("", "end", iid=str(i), values=values, tags=(tag,))
 
         self.dir_combo.configure(values=[UNCLASSIFIED] + list(self.cand_by_display))
         self.dir_combo.set(UNCLASSIFIED)
+
+    def _tag_for_result(self, res) -> tuple:
+        if core.is_noise_content(res.message.content):
+            return ("noise",)
+        return () if res.candidate else ("unmatched",)
+
+    def _apply_result_to_row(self, idx: int, res) -> None:
+        """把一条分类结果写回 assignments 与表格行。"""
+        item = self.assignments[idx]
+        item["result"] = res
+        item["target"] = res.candidate
+        values = list(self.tree.item(str(idx), "values"))
+        values[3] = core.display_rel(res.candidate) if res.candidate else UNCLASSIFIED
+        values[4] = res.reason
+        self.tree.item(str(idx), values=values, tags=(self._tag_for_result(res),))
+
+    def _on_batch_progress(self, done: int, total: int, failed: int, chunk) -> None:
+        # 实时刷新：本批结果一到就更新对应行
+        for res in chunk:
+            idx = self._msg_index.get(id(res.message))
+            if idx is not None:
+                self._apply_result_to_row(idx, res)
+        elapsed = max(0, int(time.monotonic() - self._analysis_started))
+        extra = f"（{failed} 失败）" if failed else ""
+        shown = sum(1 for a in self.assignments if a["result"] is not None) + self._noise_count
+        self.status_var.set(
+            f"LLM 分类中：已完成 {done}/{total} 批{extra} · "
+            f"已出结果 {shown}/{len(self.assignments)} 条 · 已用 {elapsed} 秒…"
+        )
+
+    def _on_analysis_failed(self, error: str) -> None:
+        self._cancel_event = None
+        self.analyze_btn.configure(text="分 析", command=self._start_analysis, state="normal")
+        # 中途失败：尚未出结果的行标“分析中止”，已出结果的行保持原样
+        for i, item in enumerate(self.assignments):
+            if item["result"] is None and not core.is_noise_content(item["message"].content):
+                values = list(self.tree.item(str(i), "values"))
+                values[3] = UNCLASSIFIED
+                values[4] = "分析中止"
+                self.tree.item(str(i), values=values, tags=("unmatched",))
+        self.status_var.set("分析失败，请检查路径与 API 配置后重试。")
+        messagebox.showerror("分析失败", error)
+
+    def _on_analysis_done(self, results) -> None:
+        self._cancel_event = None
+        self.analyze_btn.configure(text="分 析", command=self._start_analysis)
+        # 用最终结果全量刷新一遍（补齐系统/附件行等所有行），保证与整体结果一致
+        for i, res in enumerate(results):
+            if i < len(self.assignments):
+                self._apply_result_to_row(i, res)
         self.dir_combo.configure(state="readonly")
         self.apply_btn.configure(state="normal")
         self.analyze_btn.configure(state="normal")
@@ -330,7 +372,7 @@ class ChatSorterApp(tk.Tk):
         self.confirm_btn.configure(text=f"确认写入（{count} 条）")
 
     def _confirm_write(self) -> None:
-        pairs = [(item["target"], item["result"].message) for item in self.assignments if item["target"]]
+        pairs = [(item["target"], item["message"]) for item in self.assignments if item["target"]]
         unclassified = len(self.assignments) - len(pairs)
         if not pairs:
             messagebox.showinfo("没有可写入的消息", "当前没有消息被指定到任何目录（未分类的消息不会写入）。")
@@ -369,14 +411,15 @@ class ChatSorterApp(tk.Tk):
         if not selected:
             return
         item = self.assignments[int(selected[0])]
-        msg = item["result"].message
+        msg = item["message"]
+        reason = item["result"].reason if item["result"] else ""
         win = tk.Toplevel(self)
         win.title(f"消息详情 - {msg.time_str}")
         win.geometry("820x560")
         header = (
             f"时间: {msg.time_str}\n发送者: {msg.sender_display} ({msg.sender_username})\n"
             f"当前目标目录: {core.display_rel(item['target']) if item['target'] else UNCLASSIFIED}\n"
-            f"LLM 理由: {item['result'].reason}\n" + "-" * 60 + "\n\n"
+            f"LLM 理由: {reason}\n" + "-" * 60 + "\n\n"
         )
         text = scrolledtext.ScrolledText(win, wrap="word")
         text.pack(fill="both", expand=True)

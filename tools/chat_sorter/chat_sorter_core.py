@@ -244,8 +244,9 @@ def classify_with_llm(
     - 其余消息按 batch_size 分批，concurrency 个线程并发调用 call_llm；
     - 每批失败自动重试 2 次，仍失败则该批消息标“LLM调用失败”（不中断整体）；
     - cancel_event 置位后，未开始的批不再调用 LLM，相关消息标“已取消”；
-    - progress_cb(done, total, failed) 在每批完成后回调（在 worker 线程中执行），
-      failed 为累计失败批数（重试耗尽）。
+    - progress_cb(done, total, failed, chunk) 在每批完成后回调（在 worker 线程中执行），
+      failed 为累计失败批数（重试耗尽），chunk 为本批的 ClassifyResult 列表，
+      可用于把已完成的结果实时显示到界面。
     """
     results: list[ClassifyResult | None] = [None] * len(messages)
     todo_idx: list[int] = []
@@ -307,7 +308,7 @@ def classify_with_llm(
                 failed_batches += 1
             if progress_cb:
                 try:
-                    progress_cb(done, total, failed_batches)
+                    progress_cb(done, total, failed_batches, list(out))
                 except Exception:
                     pass
 
