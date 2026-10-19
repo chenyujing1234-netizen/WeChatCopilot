@@ -65,6 +65,7 @@ class ChatSorterApp(tk.Tk):
         self._msg_index: dict[int, int] = {}  # id(消息) -> 行号，用于把批次结果映射回表格行
         self._noise_count = 0  # 系统/附件消息数（分析开始即已知，无需等 LLM）
         self._cache: dict = {}  # 分类缓存（分析开始时从磁盘加载，确认写入后更新）
+        self._dir_editor: ttk.Combobox | None = None  # 行内目录编辑器（双击“推荐目录”列出现）
         cfg = load_llm_config()
 
         self._build_ui(cfg)
@@ -154,7 +155,7 @@ class ChatSorterApp(tk.Tk):
         self.tree.tag_configure("noise", foreground="#888888")
         self.tree.tag_configure("unmatched", foreground="#b06000")
         self.tree.tag_configure("pending", foreground="#7a7aa0")  # 分析中、尚未出结果的行
-        self.tree.bind("<Double-1>", self._show_detail)
+        self.tree.bind("<Double-1>", self._on_tree_double_click)
         ybar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=ybar.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -369,8 +370,71 @@ class ChatSorterApp(tk.Tk):
         self.apply_btn.configure(state="normal")
         self.analyze_btn.configure(state="normal")
         self.confirm_btn.configure(state="normal")
-        self.status_var.set(core.summarize(results) + "  双击行可查看完整内容。")
+        self.status_var.set(core.summarize(results) + "  双击行查看内容；双击“推荐目录”单元格可直接修改目标目录。")
         self._refresh_confirm_label()
+
+    def _on_tree_double_click(self, event) -> None:
+        """双击“推荐目录”列：行内下拉直接修改该行目录；其余位置打开消息详情。"""
+        if (
+            self.tree.identify("region", event.x, event.y) == "cell"
+            and self.tree.identify_column(event.x) == "#4"
+        ):
+            row = self.tree.identify_row(event.y)
+            if row:
+                self._begin_dir_edit(row)
+            return
+        self._show_detail(event)
+
+    def _begin_dir_edit(self, row: str) -> None:
+        if self._cancel_event is not None:
+            self.status_var.set("分析进行中，请等本轮结束后再修改目录。")
+            return
+        if not self.cand_by_display:
+            messagebox.showinfo("无候选目录", "尚未扫描到候选目录，请先完成一次分析。")
+            return
+        self._end_dir_edit()  # 同一时间只保留一个编辑器
+        bbox = self.tree.bbox(row, column="#4")
+        if not bbox:
+            return
+        x, y, w, h = bbox
+        item = self.assignments[int(row)]
+        current = core.display_rel(item["target"]) if item["target"] else UNCLASSIFIED
+        editor = ttk.Combobox(
+            self.tree,
+            state="readonly",
+            values=[UNCLASSIFIED] + list(self.cand_by_display),
+        )
+        editor.set(current)
+        editor.place(x=x, y=y, width=max(w, 200), height=h)
+        editor.focus_set()
+        editor.bind("<<ComboboxSelected>>", lambda _e: self._commit_dir_edit(row))
+        editor.bind("<Return>", lambda _e: self._commit_dir_edit(row))
+        editor.bind("<Escape>", lambda _e: self._end_dir_edit())
+        editor.bind("<FocusOut>", lambda _e: self._end_dir_edit())
+        self._dir_editor = editor
+
+    def _commit_dir_edit(self, row: str) -> None:
+        if self._dir_editor is None:
+            return
+        choice = self._dir_editor.get()
+        self._end_dir_edit()
+        target = None if choice == UNCLASSIFIED else self.cand_by_display.get(choice)
+        if choice != UNCLASSIFIED and target is None:
+            return  # 只能从候选列表中选
+        item = self.assignments[int(row)]
+        item["target"] = target
+        values = list(self.tree.item(row, "values"))
+        values[3] = core.display_rel(target) if target else UNCLASSIFIED
+        values[4] = "手动指定" if target else ""
+        self.tree.item(row, values=values)
+        if target:
+            self.tree.item(row, tags=())
+        self._refresh_confirm_label()
+
+    def _end_dir_edit(self) -> None:
+        editor, self._dir_editor = self._dir_editor, None
+        if editor is not None:
+            editor.destroy()
 
     def _apply_target(self) -> None:
         selected = self.tree.selection()
