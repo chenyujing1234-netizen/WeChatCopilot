@@ -2,9 +2,9 @@
 
 职责：
 1. 解析微信导出的 chat_txt 会话文件（如“文件传输助手.txt”）中的消息行。
-2. 扫描素材根目录（含根目录自身与递归子目录，跳过隐藏/技术目录），
-   从目录名提取关键词。
-3. 按关键词匹配为每条消息推荐归属目录（只做推荐，不写盘）。
+2. 扫描素材根目录（含根目录自身与递归子目录，跳过隐藏/技术目录），得到候选目录。
+3. 调用 LLM（OpenAI 兼容接口）判断每条消息归属哪个目录（只做推荐，不写盘）；
+   系统/附件消息（表情、文件传输记录等）自动跳过，不发给 LLM。
 4. 用户在界面确认后，按目录分组、按时间排序、整行去重后追加写入目标 txt。
 
 消息行格式（由 ContextBuddy 结构化导出生成）：
@@ -14,8 +14,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import threading
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -24,40 +29,6 @@ from pathlib import Path
 MESSAGE_LINE_RE = re.compile(
     r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s+(.+?)\(([A-Za-z0-9_\-@.]{2,64})\):\s?(.*)$"
 )
-
-# 目录名先按这些标点切分
-_NAME_SPLIT_RE = re.compile(r"[、，,；;·\s/]+")
-
-# 没有区分度的通用词，单独成段时丢弃（如“喜乐的学习”只保留“喜乐”）
-_GENERIC_WORDS = {
-    "专辑", "产品", "病情", "资料", "相关", "记录", "事情", "规划", "学习",
-    "考试", "历史", "创作", "书本", "视频", "图片", "课程", "工具", "服务",
-    "咨询", "简历", "成长", "日记", "分析", "推荐", "效果", "直播",
-}
-
-# 代词类词，不作为关键词（避免大量误命中）
-_PRONOUN_WORDS = {"我自己", "我们", "自己", "大家", "你们", "他们", "她们", "它们"}
-
-# 泛化拉丁词（英文停用词/技术目录名），段与拉丁片段命中即丢弃
-_GENERIC_LATIN_WORDS = {
-    "ai", "app", "apps", "api", "sdk", "mvp", "ppt", "ok", "top", "new", "old",
-    "and", "the", "how", "what", "when", "where", "why", "who", "for", "you",
-    "your", "with", "from", "this", "that", "these", "those", "not", "are",
-    "was", "were", "been", "our", "out", "use", "used", "using", "can", "has",
-    "have", "had", "will", "would", "one", "two", "get", "got", "see", "its",
-    "his", "her", "into", "more", "most", "than", "then", "them", "they",
-    "there", "their", "some", "such", "only", "also", "just", "like", "over",
-    "after", "before", "while", "about", "because", "very", "much", "many",
-    "each", "other", "which", "all", "any", "may", "might", "must", "should",
-    "could", "does", "did", "done", "via", "per", "off", "own", "same", "keep",
-    "now", "let", "lets",
-    "output", "temp", "tmp", "cache", "dist", "build", "src", "docs", "doc",
-    "test", "tests", "assets", "images", "image", "video", "videos", "audio",
-    "backup", "bak", "draft", "final", "copy", "file", "files", "folder",
-    "project", "projects", "data", "info", "log", "logs", "ref", "refs",
-    "note", "notes", "readme", "config", "lib", "libs", "bin", "utils",
-    "tools", "demo", "sample", "examples", "master", "main",
-}
 
 # 技术性目录名（导出数据自身/公众号/群聊 ID），整棵子树跳过
 _ID_NAME_RE = re.compile(r"^(wxid_|gh_)[A-Za-z0-9_-]+$|@chatroom$", re.IGNORECASE)
@@ -68,8 +39,22 @@ _EXCLUDED_DIR_NAMES = {
     "__pycache__", "node_modules", ".git", ".venv",
 }
 
-# 消息内容含这些标记时视为系统/附件消息，不做自动分类（仍可手动指定目录）
+# 消息内容含这些标记时视为系统/附件消息，不发送给 LLM（仍可手动指定目录）
 _NOISE_MARKERS = ("<?xml", "@cdn_", "eyj", "<sysmsg", "<emoji", "<msgsource>")
+
+# 单条消息送入 LLM 的最大字符数
+_LLM_CONTENT_LIMIT = 600
+# 候选目录送入 LLM 的最大条数
+_LLM_DIR_LIMIT = 1000
+
+LLM_SYSTEM_PROMPT = """你是微信聊天记录归档助手。用户给你一个候选目录列表（相对路径）和一批编号的聊天消息。
+任务：为每条消息判断它最适合归档到哪个人的目录/哪个主题目录。
+规则：
+- 目录名多为人物（如家人、孩子、同事）或专辑主题；消息内容与某个人相关，就选对应人的目录。
+- 只能从候选目录列表中选择，dir 字段必须与列表中的路径完全一致；没有合适目录时 dir 为空字符串。
+- reason 用不超过 20 个字说明判断理由。
+输出严格 JSON（不要 Markdown 代码块、不要多余文字）：
+{"results":[{"index":1,"dir":"喜乐","reason":"提到孩子喜乐"}]}"""
 
 
 @dataclass
@@ -86,16 +71,13 @@ class CandidateDir:
     path: Path
     rel_display: str  # 相对根目录的显示路径；根目录自身为 "."
     depth: int
-    keywords: list[str] = field(default_factory=list)
 
 
 @dataclass
 class ClassifyResult:
     message: ChatMessage
     candidate: CandidateDir | None = None
-    matched_keywords: list[str] = field(default_factory=list)
-    score: int = 0
-    reason: str = ""  # 未分类原因（未匹配 / 系统附件消息）
+    reason: str = ""  # LLM 给出的判断理由；未分类时为原因说明
 
 
 @dataclass
@@ -130,45 +112,11 @@ def parse_chat_txt(file_path: str | os.PathLike) -> list[ChatMessage]:
 
 
 def is_noise_content(content: str) -> bool:
-    """系统/附件消息（表情、文件传输记录、链接 XML 等）不做自动分类。"""
+    """系统/附件消息（表情、文件传输记录、链接 XML 等）不发送给 LLM。"""
     if not content.strip():
         return True
     low = content.lower()
     return any(marker in low for marker in _NOISE_MARKERS)
-
-
-def extract_keywords(name: str) -> list[str]:
-    """从目录名提取分类关键词。
-
-    规则：按标点与“的”切分；丢弃通用词、代词、纯数字与单字（如“我”）；
-    另外提取段内长度>=3 且以字母开头的拉丁串（如“KET考试”->“KET”）。
-    """
-    name = str(name or "").strip()
-    if not name or _ID_NAME_RE.match(name):
-        return []
-    keywords: list[str] = []
-    for part in _NAME_SPLIT_RE.split(name):
-        for seg in part.split("的"):
-            seg = seg.strip("·._-—（）()【】[]:：!！?？")
-            if not seg or seg in _GENERIC_WORDS or seg in _PRONOUN_WORDS:
-                continue
-            if seg.isdigit() or len(seg) < 2:
-                continue
-            if seg.lower() not in _GENERIC_LATIN_WORDS:
-                keywords.append(seg)
-            for latin in re.finditer(r"[A-Za-z][A-Za-z0-9]{2,}", seg):
-                token = latin.group(0)
-                if token.lower() not in _GENERIC_LATIN_WORDS:
-                    keywords.append(token)
-    seen: set[str] = set()
-    out: list[str] = []
-    for kw in keywords:
-        key = kw.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(kw)
-    return out
 
 
 def scan_candidate_dirs(root: str | os.PathLike) -> list[CandidateDir]:
@@ -183,7 +131,6 @@ def scan_candidate_dirs(root: str | os.PathLike) -> list[CandidateDir]:
             path=path,
             rel_display="." if not rel.parts else rel.as_posix(),
             depth=len(rel.parts),
-            keywords=extract_keywords(path.name),
         )
 
     out = [make(root)]
@@ -202,45 +149,149 @@ def scan_candidate_dirs(root: str | os.PathLike) -> list[CandidateDir]:
     return out
 
 
-def classify_message(message: ChatMessage, candidates: list[CandidateDir]) -> ClassifyResult:
-    """为单条消息推荐目录：关键词命中计分，取分数最高者。
+# ---------- LLM 分类 ----------
 
-    平分时更浅的目录优先（如“喜乐”优先于“喜乐的KET考试”），
-    内容更具体的目录靠更高分数胜出。
+
+def display_rel(cand: CandidateDir) -> str:
+    """目录在界面/提示词中的显示名：根目录自身显示为“(根目录)”。"""
+    return "(根目录)" if cand.rel_display == "." else cand.rel_display
+
+
+def build_llm_messages(candidates: list[CandidateDir], messages: list[ChatMessage]) -> list[dict]:
+    """构造单批分类请求的消息体：候选目录列表 + 编号消息。"""
+    lines = ["候选目录列表："]
+    for cand in candidates[:_LLM_DIR_LIMIT]:
+        lines.append(f"- {display_rel(cand)}")
+    if len(candidates) > _LLM_DIR_LIMIT:
+        lines.append(f"（目录过多，仅列出前 {_LLM_DIR_LIMIT} 个）")
+    lines.append("")
+    lines.append("消息：")
+    for idx, msg in enumerate(messages, start=1):
+        content = msg.content
+        if len(content) > _LLM_CONTENT_LIMIT:
+            content = content[:_LLM_CONTENT_LIMIT] + "…"
+        lines.append(f"{idx}. [{msg.time_str}] {content}")
+    return [
+        {"role": "system", "content": LLM_SYSTEM_PROMPT},
+        {"role": "user", "content": "\n".join(lines)},
+    ]
+
+
+def parse_llm_results(text: str) -> dict[int, tuple[str, str]]:
+    """解析 LLM 返回文本中的 JSON：{编号: (目录显示名, 理由)}。
+
+    兼容模型输出的 Markdown 代码块等包装（取首个“{”到末个“}”之间的内容）。
     """
-    if is_noise_content(message.content):
-        return ClassifyResult(message=message, reason="系统/附件消息")
-
-    low = message.content.lower()
-    best_key: tuple | None = None
-    best_cand: CandidateDir | None = None
-    best_matched: list[str] = []
-    best_score = 0
-    for cand in candidates:
-        matched = [kw for kw in cand.keywords if kw.lower() in low]
-        if not matched:
+    text = str(text or "").strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("LLM 返回中没有 JSON 对象")
+    data = json.loads(text[start : end + 1])
+    out: dict[int, tuple[str, str]] = {}
+    for item in data.get("results", []):
+        if not isinstance(item, dict):
             continue
-        score = sum(len(kw) for kw in matched)
-        key = (-score, cand.depth, cand.rel_display)
-        if best_key is None or key < best_key:
-            best_key = key
-            best_cand = cand
-            best_matched = matched
-            best_score = score
-    if best_cand is None:
-        return ClassifyResult(message=message, reason="未匹配到任何目录关键词")
-    return ClassifyResult(
-        message=message,
-        candidate=best_cand,
-        matched_keywords=best_matched,
-        score=best_score,
+        try:
+            idx = int(item.get("index"))
+        except (TypeError, ValueError):
+            continue
+        out[idx] = (str(item.get("dir", "")).strip(), str(item.get("reason", "")).strip())
+    return out
+
+
+def openai_chat_call(
+    base_url: str, api_key: str, model: str, messages: list[dict], *, timeout: int = 180
+) -> str:
+    """调用 OpenAI 兼容的 /chat/completions，返回助手文本（仅用标准库）。"""
+    url = str(base_url or "").rstrip("/") + "/chat/completions"
+    payload = json.dumps(
+        {"model": model, "messages": messages, "temperature": 0.1, "max_tokens": 4000},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
     )
+    with urllib.request.urlopen(request, timeout=timeout) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    return body["choices"][0]["message"]["content"]
 
 
-def classify_messages(
-    messages: list[ChatMessage], candidates: list[CandidateDir]
+def classify_with_llm(
+    messages: list[ChatMessage],
+    candidates: list[CandidateDir],
+    *,
+    call_llm,
+    batch_size: int = 20,
+    concurrency: int = 4,
+    progress_cb=None,
 ) -> list[ClassifyResult]:
-    return [classify_message(msg, candidates) for msg in messages]
+    """用 LLM 批量判断每条消息的归属目录。
+
+    - 系统/附件消息不发送 LLM，直接标“系统/附件”；
+    - 其余消息按 batch_size 分批，concurrency 个线程并发调用 call_llm；
+    - 每批失败自动重试 2 次，仍失败则该批消息标“LLM调用失败”（不中断整体）；
+    - progress_cb(done, total) 在每批完成后回调（在 worker 线程中执行）。
+    """
+    results: list[ClassifyResult | None] = [None] * len(messages)
+    todo_idx: list[int] = []
+    for i, msg in enumerate(messages):
+        if is_noise_content(msg.content):
+            results[i] = ClassifyResult(message=msg, reason="系统/附件消息，自动跳过")
+        else:
+            todo_idx.append(i)
+
+    cand_index = {display_rel(c): c for c in candidates}
+    batches = [todo_idx[k : k + batch_size] for k in range(0, len(todo_idx), batch_size)]
+    total = len(batches)
+    done = 0
+    lock = threading.Lock()
+
+    def run_batch(indices: list[int]) -> None:
+        nonlocal done
+        batch_messages = [messages[i] for i in indices]
+        parsed = None
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                parsed = parse_llm_results(call_llm(build_llm_messages(candidates, batch_messages)))
+                break
+            except Exception as exc:  # 网络/解析失败统一重试
+                last_error = exc
+                time.sleep(1.5 * (attempt + 1))
+        out: list[ClassifyResult] = []
+        for n, gi in enumerate(indices, start=1):
+            if parsed is None:
+                out.append(
+                    ClassifyResult(message=messages[gi], reason=f"LLM调用失败：{last_error}")
+                )
+                continue
+            dir_name, reason = parsed.get(n, ("", ""))
+            cand = cand_index.get(dir_name) if dir_name else None
+            if dir_name and cand is None:
+                reason = f"LLM返回了无效目录“{dir_name}”，未采纳"
+            elif not cand and not reason:
+                reason = "LLM判断为未分类"
+            out.append(ClassifyResult(message=messages[gi], candidate=cand, reason=reason))
+        with lock:
+            for gi, res in zip(indices, out):
+                results[gi] = res
+            done += 1
+            if progress_cb:
+                try:
+                    progress_cb(done, total)
+                except Exception:
+                    pass
+
+    if batches:
+        workers = max(1, min(int(concurrency or 1), total))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(run_batch, batches))
+    return [r if r is not None else ClassifyResult(message=messages[i], reason="未处理") for i, r in enumerate(results)]
+
+
+# ---------- 写入 ----------
 
 
 def sanitize_output_name(name: object) -> str:
@@ -304,37 +355,16 @@ def apply_writes(
     return reports
 
 
-def display_rel(cand: CandidateDir) -> str:
-    """目录在界面上的显示名：根目录自身显示为“(根目录)”。"""
-    return "(根目录)" if cand.rel_display == "." else cand.rel_display
-
-
 def summarize(results: list[ClassifyResult]) -> str:
     """生成一行统计摘要。"""
     total = len(results)
     classified = sum(1 for r in results if r.candidate is not None)
     noise = sum(1 for r in results if is_noise_content(r.message.content))
-    return (
-        f"共 {total} 条消息：已推荐 {classified} 条，"
+    failed = sum(1 for r in results if r.reason.startswith("LLM调用失败"))
+    text = (
+        f"共 {total} 条消息：LLM 已推荐 {classified} 条，"
         f"未分类 {total - classified} 条（其中系统/附件 {noise} 条）"
     )
-
-
-if __name__ == "__main__":
-    # 命令行只读自检：python chat_sorter_core.py <会话txt> <素材根目录>
-    import sys
-
-    if len(sys.argv) < 3:
-        print("用法: python chat_sorter_core.py <会话txt> <素材根目录>")
-        sys.exit(1)
-    msgs = parse_chat_txt(sys.argv[1])
-    cands = scan_candidate_dirs(sys.argv[2])
-    results = classify_messages(msgs, cands)
-    print(summarize(results))
-    counter: dict[str, int] = {}
-    for res in results:
-        if res.candidate is not None:
-            key = display_rel(res.candidate)
-            counter[key] = counter.get(key, 0) + 1
-    for key, count in sorted(counter.items(), key=lambda kv: -kv[1]):
-        print(f"  {count:5d}  {key}")
+    if failed:
+        text += f"，LLM 调用失败 {failed} 条（可重新分析或手动指定目录）"
+    return text
