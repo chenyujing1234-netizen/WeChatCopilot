@@ -1,8 +1,8 @@
 """文件传输助手聊天分类工具——tkinter 界面。
 
-流程：选好源文件与素材根目录 -> 点“加载”先展示全部消息，双击“涉及人物”列
-标注聊天人物（从列表选择或新增）-> 点“分析”（LLM 把人物标注一并考虑，
-逐批推荐目录，只推荐不写盘）-> 在表格中查看/修改目标目录 -> 点“确认写入”
+流程：选好源文件与素材根目录 -> 点“加载”先展示全部消息，双击行弹出内容详情
+并在窗口内标注“涉及人物”（从列表选择或新增）-> 点“分析”（LLM 把人物标注一并
+考虑，逐批推荐目录，只推荐不写盘）-> 在表格中查看/修改目标目录 -> 点“确认写入”
 把消息连同人物标注一起追加到各目录的 txt。
 LLM 配置保存在脚本旁的 llm_config.json，下次启动自动加载。
 """
@@ -125,7 +125,7 @@ class ChatSorterApp(tk.Tk):
         self.analyze_btn.pack(side="left", padx=(0, 4))
 
         self.status_var = tk.StringVar(
-            value="先点“加 载”展示全部消息，双击“涉及人物”列标注聊天人物，再点“分 析”让 LLM 推荐目录（分析不写任何文件）。"
+            value="先点“加 载”展示全部消息，双击行查看内容并标注“涉及人物”，再点“分 析”让 LLM 推荐目录（分析不写任何文件）。"
         )
         ttk.Label(self, textvariable=self.status_var, padding=(12, 2)).pack(fill="x")
 
@@ -244,7 +244,7 @@ class ChatSorterApp(tk.Tk):
         self.apply_btn.configure(state="normal")
         self.status_var.set(
             f"已加载 {len(messages)} 条消息、{len(candidates)} 个候选目录。"
-            "双击“涉及人物”列可标注聊天人物；点“分 析”让 LLM 结合人物推荐目录。"
+            "双击行弹出内容详情并可修改“涉及人物”；点“分 析”让 LLM 结合人物推荐目录。"
         )
         return True
 
@@ -438,26 +438,21 @@ class ChatSorterApp(tk.Tk):
         self.confirm_btn.configure(state="normal")
         self.status_var.set(
             core.summarize(results)
-            + "  双击“推荐目录”改目录；双击“涉及人物”标注人物（改完再分析会把新人物考虑进去）；双击其他位置看详情。"
+            + "  双击“推荐目录”单元格改目录；双击其他位置弹出内容详情，窗口内可修改“涉及人物”（改完再分析会把新人物考虑进去）。"
         )
         self._refresh_confirm_label()
 
     def _on_tree_double_click(self, event) -> None:
-        """双击分发：#4“涉及人物”列开标注对话框，#5“推荐目录”列行内改目录，其余看详情。"""
+        """双击分发：#5“推荐目录”列行内改目录；其余任意位置弹出内容详情（窗口内可改人物）。"""
         if self.tree.identify("region", event.x, event.y) != "cell":
-            self._show_detail(event)
             return
-        col = self.tree.identify_column(event.x)
         row = self.tree.identify_row(event.y)
         if not row:
-            self._show_detail(event)
             return
-        if col == "#4":
-            self._edit_people(row)
-        elif col == "#5":
+        if self.tree.identify_column(event.x) == "#5":
             self._begin_dir_edit(row)
         else:
-            self._show_detail(event)
+            self._show_detail(row)
 
     def _people_choices(self, extra: list[str] | None = None) -> list[str]:
         """人物候选名单：顶层候选目录名 + 用户新增人物 + 所有已标注过的人物。"""
@@ -469,25 +464,15 @@ class ChatSorterApp(tk.Tk):
             names.update(extra)
         return sorted(names)
 
-    def _edit_people(self, row: str) -> None:
-        """双击“涉及人物”列：弹窗多选标注该消息的聊天人物，可新增列表外人物。"""
-        if self._cancel_event is not None:
-            self.status_var.set("分析进行中，请等本轮结束后再标注人物。")
-            return
-        if not self.assignments:
-            messagebox.showinfo("未加载数据", "请先点击“加 载”展示消息。")
-            return
-        item = self.assignments[int(row)]
-        msg = item["message"]
-        win = tk.Toplevel(self)
-        win.title(f"标注涉及人物 - 第 {int(row) + 1} 条")
-        win.geometry("360x430")
-        win.transient(self)
-        ttk.Label(win, text="勾选该消息涉及的聊天人物（可多选）：", padding=(10, 10, 10, 4)).pack(anchor="w")
+    def _build_people_selector(self, parent, msg) -> tuple:
+        """在 parent 内创建人物多选控件（候选列表 + 新增输入行），返回 (selected_names, refill)。
 
-        list_frame = ttk.Frame(win)
-        list_frame.pack(fill="both", expand=True, padx=10)
-        listbox = tk.Listbox(list_frame, selectmode="multiple", exportselection=False)
+        selected_names() 返回当前勾选的人物集合；refill(select) 以新勾选集合重建
+        列表（新增人物后调用，保证新名字出现在列表中并处于勾选状态）。
+        """
+        list_frame = ttk.Frame(parent)
+        list_frame.pack(fill="x")
+        listbox = tk.Listbox(list_frame, selectmode="multiple", exportselection=False, height=5)
         scroll = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
         listbox.configure(yscrollcommand=scroll.set)
         listbox.pack(side="left", fill="both", expand=True)
@@ -505,12 +490,11 @@ class ChatSorterApp(tk.Tk):
 
         refill(set(msg.people))
 
-        add_row = ttk.Frame(win, padding=(10, 6))
-        add_row.pack(fill="x")
+        add_row = ttk.Frame(parent)
+        add_row.pack(fill="x", pady=(4, 0))
         new_var = tk.StringVar()
         entry = ttk.Entry(add_row, textvariable=new_var)
         entry.pack(side="left", fill="x", expand=True)
-        entry.focus_set()
 
         def add_person() -> None:
             name = new_var.get().strip()
@@ -526,21 +510,10 @@ class ChatSorterApp(tk.Tk):
             entry.focus_set()
 
         ttk.Button(add_row, text="新增并勾选", command=add_person).pack(side="left", padx=(6, 0))
-        win.bind("<Return>", lambda _e: add_person())
-
-        btn_row = ttk.Frame(win, padding=(10, 6))
-        btn_row.pack()
-
-        def commit() -> None:
-            self._commit_people(row, sorted(selected_names()))
-            win.destroy()
-
-        ttk.Button(btn_row, text="确 定", command=commit).pack(side="left", padx=6)
-        ttk.Button(btn_row, text="取 消", command=win.destroy).pack(side="left", padx=6)
-        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        return selected_names, refill
 
     def _commit_people(self, row: str, people: list[str]) -> None:
-        """把人物标注应用到消息、持久化缓存与表格行（由标注对话框“确定”调用）。"""
+        """把人物标注应用到消息、持久化缓存与表格行（由详情窗口“保存并关闭”调用）。"""
         item = self.assignments[int(row)]
         msg = item["message"]
         msg.people = core.normalize_people(people)
@@ -679,25 +652,48 @@ class ChatSorterApp(tk.Tk):
             }
         self._save_cache_file()
 
-    def _show_detail(self, _event) -> None:
-        selected = self.tree.selection()
-        if not selected:
+    def _show_detail(self, row: str) -> None:
+        """双击行：弹出该行内容文本，并可在窗口内直接修改“涉及人物”。"""
+        if not self.assignments:
+            messagebox.showinfo("未加载数据", "请先点击“加 载”展示消息。")
             return
-        item = self.assignments[int(selected[0])]
+        item = self.assignments[int(row)]
         msg = item["message"]
         reason = item["result"].reason if item["result"] else ""
         win = tk.Toplevel(self)
         win.title(f"消息详情 - {msg.time_str}")
-        win.geometry("820x560")
-        header = (
-            f"时间: {msg.time_str}\n发送者: {msg.sender_display} ({msg.sender_username})\n"
-            f"涉及人物: {'、'.join(msg.people) or '（未标注）'}\n"
+        win.geometry("860x640")
+        info = (
+            f"时间: {msg.time_str}    发送者: {msg.sender_display} ({msg.sender_username})\n"
             f"当前目标目录: {core.display_rel(item['target']) if item['target'] else UNCLASSIFIED}\n"
-            f"LLM 理由: {reason}\n" + "-" * 60 + "\n\n"
+            f"LLM 理由: {reason}"
         )
+        ttk.Label(win, text=info, justify="left", padding=(12, 10, 12, 4)).pack(anchor="w")
+
+        # 涉及人物：列表多选 + 新增，保存后写回消息、缓存与表格行
+        people_frame = ttk.LabelFrame(win, text="涉及人物（勾选，可新增列表外人物）", padding=(8, 6))
+        people_frame.pack(fill="x", padx=12)
+        selected_names, _refill = self._build_people_selector(people_frame, msg)
+
+        btn_row = ttk.Frame(people_frame)
+        btn_row.pack(pady=(6, 0))
+
+        def save() -> None:
+            if self._cancel_event is not None:
+                self.status_var.set("分析进行中，请等本轮结束后再修改人物。")
+                return
+            self._commit_people(row, sorted(selected_names()))
+            win.destroy()
+
+        save_btn = ttk.Button(btn_row, text="保存并关闭", command=save)
+        save_btn.pack(side="left", padx=4)
+        ttk.Button(btn_row, text="取 消", command=win.destroy).pack(side="left", padx=4)
+        if self._cancel_event is not None:
+            save_btn.configure(state="disabled")  # 分析中禁止修改人物
+
         text = scrolledtext.ScrolledText(win, wrap="word")
-        text.pack(fill="both", expand=True)
-        text.insert("1.0", header + msg.content.replace("\\n", "\n"))
+        text.pack(fill="both", expand=True, padx=12, pady=(6, 10))
+        text.insert("1.0", msg.content.replace("\\n", "\n"))
         text.configure(state="disabled")
 
 
