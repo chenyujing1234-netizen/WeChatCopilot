@@ -132,8 +132,13 @@ class ChatSorterApp(tk.Tk):
             assign, text="全不选", command=lambda: self.tree.selection_remove(self.tree.selection())
         ).pack(side="left")
 
+        # 列表区：先建容器，Treeview 必须以容器为父级，
+        # 否则列表会被排到主窗口底部，中间只剩一片空白
+        tree_frame = ttk.Frame(self)
+        tree_frame.pack(fill="both", expand=True, padx=10, pady=4)
+
         columns = ("idx", "time", "preview", "dir", "reason")
-        self.tree = ttk.Treeview(self, columns=columns, show="headings", selectmode="extended")
+        self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="extended")
         for col, text, width, anchor in (
             ("idx", "序号", 56, "e"),
             ("time", "时间", 138, "w"),
@@ -147,9 +152,6 @@ class ChatSorterApp(tk.Tk):
         self.tree.tag_configure("unmatched", foreground="#b06000")
         self.tree.tag_configure("pending", foreground="#7a7aa0")  # 分析中、尚未出结果的行
         self.tree.bind("<Double-1>", self._show_detail)
-
-        tree_frame = ttk.Frame(self)
-        tree_frame.pack(fill="both", expand=True, padx=10, pady=4)
         ybar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=ybar.set)
         self.tree.pack(side="left", fill="both", expand=True)
