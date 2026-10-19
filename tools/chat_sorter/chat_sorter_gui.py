@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -57,6 +58,8 @@ class ChatSorterApp(tk.Tk):
         self.candidates: list[core.CandidateDir] = []
         self.cand_by_display: dict[str, core.CandidateDir] = {}
         self._queue: queue.Queue = queue.Queue()
+        self._cancel_event: threading.Event | None = None  # 分析运行中的取消信号
+        self._analysis_started: float = 0.0  # 本轮分析开始时刻（monotonic），用于显示已用秒数
         cfg = load_llm_config()
 
         self._build_ui(cfg)
@@ -102,6 +105,9 @@ class ChatSorterApp(tk.Tk):
         self.batch_var = tk.IntVar(value=int(cfg.get("batch_size", 20)))
         ttk.Spinbox(out_row, from_=5, to=50, textvariable=self.batch_var, width=5).pack(side="left", padx=3)
         ttk.Spinbox(out_row, from_=1, to=8, textvariable=self.conc_var, width=5).pack(side="left", padx=(14, 0))
+        ttk.Label(out_row, text="目录深度:").pack(side="left", padx=(14, 0))
+        self.depth_var = tk.IntVar(value=int(cfg.get("max_depth", 1)))
+        ttk.Spinbox(out_row, from_=1, to=5, textvariable=self.depth_var, width=5).pack(side="left", padx=3)
         self.analyze_btn = ttk.Button(out_row, text="分 析", command=self._start_analysis)
         self.analyze_btn.pack(side="left", padx=(18, 4))
 
@@ -192,20 +198,30 @@ class ChatSorterApp(tk.Tk):
             "api_key": api_key,
             "concurrency": max(1, min(8, int(self.conc_var.get() or 4))),
             "batch_size": max(5, min(50, int(self.batch_var.get() or 20))),
+            "max_depth": max(1, min(5, int(self.depth_var.get() or 1))),
             "output_name": self.out_var.get().strip(),
         }
         save_llm_config(cfg)
-        self.analyze_btn.configure(state="disabled")
+        self._cancel_event = threading.Event()
+        self._analysis_started = time.monotonic()
+        # 运行中按钮变为“停止”，可随时中止剩余批次（已完成的结果仍然保留）
+        self.analyze_btn.configure(text="停 止", command=self._cancel_analysis)
         self.confirm_btn.configure(state="disabled")
         self.apply_btn.configure(state="disabled")
         self.dir_combo.configure(state="disabled")
         self.status_var.set("正在解析消息与扫描目录…")
         threading.Thread(target=self._analyze_worker, args=(cfg,), daemon=True).start()
 
+    def _cancel_analysis(self) -> None:
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+        self.analyze_btn.configure(state="disabled")
+        self.status_var.set("正在停止：等待进行中的 LLM 批次结束后，返回已完成的分类…")
+
     def _analyze_worker(self, cfg: dict) -> None:
         try:
             messages = core.parse_chat_txt(cfg["source"])
-            candidates = core.scan_candidate_dirs(cfg["root"])
+            candidates = core.scan_candidate_dirs(cfg["root"], max_depth=cfg.get("max_depth"))
 
             def call_llm(llm_messages: list[dict]) -> str:
                 return core.openai_chat_call(
@@ -218,7 +234,10 @@ class ChatSorterApp(tk.Tk):
                 call_llm=call_llm,
                 batch_size=cfg["batch_size"],
                 concurrency=cfg["concurrency"],
-                progress_cb=lambda done, total: self._queue.put(("progress", done, total)),
+                progress_cb=lambda done, total, failed: self._queue.put(
+                    ("progress", done, total, failed)
+                ),
+                cancel_event=self._cancel_event,
             )
             self._queue.put(("done", results, candidates, ""))
         except Exception as exc:
@@ -230,7 +249,12 @@ class ChatSorterApp(tk.Tk):
                 item = self._queue.get_nowait()
                 kind = item[0]
                 if kind == "progress":
-                    self.status_var.set(f"LLM 分类中：已完成 {item[1]}/{item[2]} 批…")
+                    _, done, total, failed = item
+                    elapsed = max(0, int(time.monotonic() - self._analysis_started))
+                    extra = f"（{failed} 失败）" if failed else ""
+                    self.status_var.set(
+                        f"LLM 分类中：已完成 {done}/{total} 批{extra} · 已用 {elapsed} 秒…"
+                    )
                 elif kind == "done":
                     self._on_analysis_done(item[1], item[2])
                 else:
@@ -240,11 +264,14 @@ class ChatSorterApp(tk.Tk):
         self.after(100, self._poll_queue)
 
     def _on_analysis_failed(self, error: str) -> None:
-        self.analyze_btn.configure(state="normal")
+        self._cancel_event = None
+        self.analyze_btn.configure(text="分 析", command=self._start_analysis, state="normal")
         self.status_var.set("分析失败，请检查路径与 API 配置后重试。")
         messagebox.showerror("分析失败", error)
 
     def _on_analysis_done(self, results, candidates) -> None:
+        self._cancel_event = None
+        self.analyze_btn.configure(text="分 析", command=self._start_analysis)
         self.candidates = candidates
         self.cand_by_display = {core.display_rel(c): c for c in candidates}
         self.assignments = [{"result": r, "target": r.candidate} for r in results]

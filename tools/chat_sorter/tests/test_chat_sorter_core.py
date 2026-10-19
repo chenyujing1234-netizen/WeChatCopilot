@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -69,6 +70,16 @@ def test_scan_candidate_dirs(tmp_path: Path) -> None:
     assert not any("wxid_" in r for r in rels)
 
 
+def test_scan_candidate_dirs_max_depth(tmp_path: Path) -> None:
+    _make_candidates(tmp_path)
+    one = core.scan_candidate_dirs(tmp_path, max_depth=1)
+    rels = {c.rel_display for c in one}
+    # 深度 1：根目录自身 + 顶层目录，二层“周围邻居/陈轩”被剪枝
+    assert rels == {".", "喜乐", "喜乐的KET考试", "老妈的病情", "老爸", "周围邻居"}
+    two = core.scan_candidate_dirs(tmp_path, max_depth=2)
+    assert "周围邻居/陈轩" in {c.rel_display for c in two}
+
+
 def test_parse_llm_results() -> None:
     # 纯 JSON
     parsed = core.parse_llm_results('{"results":[{"index":1,"dir":"喜乐","reason":"提到孩子"}]}')
@@ -119,7 +130,7 @@ def test_classify_with_llm(tmp_path: Path) -> None:
         call_llm=fake_call,
         batch_size=20,
         concurrency=2,
-        progress_cb=lambda d, t: progress.append((d, t)),
+        progress_cb=lambda d, t, f: progress.append((d, t, f)),
     )
     # 第一条：LLM 指向“喜乐”
     assert results[0].candidate is not None and results[0].candidate.rel_display == "喜乐"
@@ -130,19 +141,48 @@ def test_classify_with_llm(tmp_path: Path) -> None:
     # 第三条：LLM 给了无效目录 -> 不采纳
     assert results[2].candidate is None
     assert "无效目录" in results[2].reason
-    assert progress and progress[-1] == (1, 1)
+    assert progress and progress[-1] == (1, 1, 0)  # 1 批完成、0 失败
+
+
+def test_classify_with_llm_cancel(tmp_path: Path) -> None:
+    candidates = _make_candidates(tmp_path)
+    messages = [_msg("2026-07-22 20:16:11", "随便聊聊天气"), _msg("2026-07-22 20:20:00", "再聊一句")]
+    cancel_event = threading.Event()
+    cancel_event.set()  # 分析前已取消：不应发起任何 LLM 调用
+    calls = []
+
+    def fake_call(llm_messages: list[dict]) -> str:
+        calls.append(llm_messages)
+        return '{"results":[]}'
+
+    results = core.classify_with_llm(
+        messages, candidates, call_llm=fake_call, cancel_event=cancel_event
+    )
+    assert not calls
+    assert all(r.candidate is None and r.reason == "已取消" for r in results)
+    # 摘要包含取消计数
+    assert "已取消 2 条" in core.summarize(results)
 
 
 def test_classify_with_llm_retry_then_fail(tmp_path: Path) -> None:
     candidates = _make_candidates(tmp_path)
     messages = [_msg("2026-07-22 20:16:11", "随便聊聊天气")]
+    progress = []
 
     def bad_call(_llm_messages: list[dict]) -> str:
         raise OSError("network down")
 
-    results = core.classify_with_llm(messages, candidates, call_llm=bad_call, concurrency=1)
+    results = core.classify_with_llm(
+        messages,
+        candidates,
+        call_llm=bad_call,
+        concurrency=1,
+        progress_cb=lambda d, t, f: progress.append((d, t, f)),
+    )
     assert results[0].candidate is None
     assert results[0].reason.startswith("LLM调用失败")
+    assert progress and progress[-1] == (1, 1, 1)  # 重试耗尽的批计入失败数
+    assert "LLM 调用失败 1 条" in core.summarize(results)
 
 
 def test_apply_writes_dedupe_and_append(tmp_path: Path) -> None:

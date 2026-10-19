@@ -119,8 +119,14 @@ def is_noise_content(content: str) -> bool:
     return any(marker in low for marker in _NOISE_MARKERS)
 
 
-def scan_candidate_dirs(root: str | os.PathLike) -> list[CandidateDir]:
-    """扫描素材根目录：根目录自身 + 递归全部子目录（跳过隐藏/技术/ID 目录）。"""
+def scan_candidate_dirs(
+    root: str | os.PathLike, max_depth: int | None = None
+) -> list[CandidateDir]:
+    """扫描素材根目录：根目录自身 + 递归子目录（跳过隐藏/技术/ID 目录）。
+
+    max_depth 限制目录层级（根目录自身为 0 层）：候选目录过多会让每批
+    LLM 提示词变得非常庞大、又慢又贵，默认建议只取 1 层（顶层目录）。
+    """
     root = Path(root)
     if not root.is_dir():
         raise FileNotFoundError(f"素材根目录不存在或不是目录：{root}")
@@ -135,6 +141,10 @@ def scan_candidate_dirs(root: str | os.PathLike) -> list[CandidateDir]:
 
     out = [make(root)]
     for dirpath, dirnames, _filenames in os.walk(root):
+        depth = len(Path(dirpath).relative_to(root).parts)
+        if max_depth is not None and depth >= max_depth:
+            dirnames[:] = []  # 已到深度上限，不再深入
+            continue
         kept = []
         for name in sorted(dirnames):
             if name.startswith(".") or name in _EXCLUDED_DIR_NAMES:
@@ -200,7 +210,7 @@ def parse_llm_results(text: str) -> dict[int, tuple[str, str]]:
 
 
 def openai_chat_call(
-    base_url: str, api_key: str, model: str, messages: list[dict], *, timeout: int = 180
+    base_url: str, api_key: str, model: str, messages: list[dict], *, timeout: int = 120
 ) -> str:
     """调用 OpenAI 兼容的 /chat/completions，返回助手文本（仅用标准库）。"""
     url = str(base_url or "").rstrip("/") + "/chat/completions"
@@ -226,13 +236,16 @@ def classify_with_llm(
     batch_size: int = 20,
     concurrency: int = 4,
     progress_cb=None,
+    cancel_event: threading.Event | None = None,
 ) -> list[ClassifyResult]:
     """用 LLM 批量判断每条消息的归属目录。
 
     - 系统/附件消息不发送 LLM，直接标“系统/附件”；
     - 其余消息按 batch_size 分批，concurrency 个线程并发调用 call_llm；
     - 每批失败自动重试 2 次，仍失败则该批消息标“LLM调用失败”（不中断整体）；
-    - progress_cb(done, total) 在每批完成后回调（在 worker 线程中执行）。
+    - cancel_event 置位后，未开始的批不再调用 LLM，相关消息标“已取消”；
+    - progress_cb(done, total, failed) 在每批完成后回调（在 worker 线程中执行），
+      failed 为累计失败批数（重试耗尽）。
     """
     results: list[ClassifyResult | None] = [None] * len(messages)
     todo_idx: list[int] = []
@@ -246,22 +259,34 @@ def classify_with_llm(
     batches = [todo_idx[k : k + batch_size] for k in range(0, len(todo_idx), batch_size)]
     total = len(batches)
     done = 0
+    failed_batches = 0
     lock = threading.Lock()
 
+    def cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
     def run_batch(indices: list[int]) -> None:
-        nonlocal done
-        batch_messages = [messages[i] for i in indices]
+        nonlocal done, failed_batches
+        is_cancelled = cancelled()
         parsed = None
         last_error: Exception | None = None
-        for attempt in range(3):
-            try:
-                parsed = parse_llm_results(call_llm(build_llm_messages(candidates, batch_messages)))
-                break
-            except Exception as exc:  # 网络/解析失败统一重试
-                last_error = exc
-                time.sleep(1.5 * (attempt + 1))
+        if not is_cancelled:
+            batch_messages = [messages[i] for i in indices]
+            for attempt in range(3):
+                if cancelled():  # 重试等待期间被取消
+                    is_cancelled = True
+                    break
+                try:
+                    parsed = parse_llm_results(call_llm(build_llm_messages(candidates, batch_messages)))
+                    break
+                except Exception as exc:  # 网络/解析失败统一重试
+                    last_error = exc
+                    time.sleep(1.5 * (attempt + 1))
         out: list[ClassifyResult] = []
         for n, gi in enumerate(indices, start=1):
+            if is_cancelled:
+                out.append(ClassifyResult(message=messages[gi], reason="已取消"))
+                continue
             if parsed is None:
                 out.append(
                     ClassifyResult(message=messages[gi], reason=f"LLM调用失败：{last_error}")
@@ -278,9 +303,11 @@ def classify_with_llm(
             for gi, res in zip(indices, out):
                 results[gi] = res
             done += 1
+            if parsed is None and not is_cancelled:
+                failed_batches += 1
             if progress_cb:
                 try:
-                    progress_cb(done, total)
+                    progress_cb(done, total, failed_batches)
                 except Exception:
                     pass
 
@@ -361,10 +388,13 @@ def summarize(results: list[ClassifyResult]) -> str:
     classified = sum(1 for r in results if r.candidate is not None)
     noise = sum(1 for r in results if is_noise_content(r.message.content))
     failed = sum(1 for r in results if r.reason.startswith("LLM调用失败"))
+    cancelled = sum(1 for r in results if r.reason == "已取消")
     text = (
         f"共 {total} 条消息：LLM 已推荐 {classified} 条，"
         f"未分类 {total - classified} 条（其中系统/附件 {noise} 条）"
     )
     if failed:
         text += f"，LLM 调用失败 {failed} 条（可重新分析或手动指定目录）"
+    if cancelled:
+        text += f"，已取消 {cancelled} 条"
     return text
