@@ -126,6 +126,15 @@ def is_noise_content(content: str) -> bool:
     return any(marker in low for marker in _NOISE_MARKERS)
 
 
+# 汉字（CJK 统一表意文字基本区，不含中文标点）
+_CHINESE_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def chinese_char_count(text: str) -> int:
+    """统计文本中的汉字个数（标点、字母、数字均不计）。"""
+    return len(_CHINESE_RE.findall(text or ""))
+
+
 def scan_candidate_dirs(
     root: str | os.PathLike, max_depth: int | None = None
 ) -> list[CandidateDir]:

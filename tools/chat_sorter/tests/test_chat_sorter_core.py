@@ -339,6 +339,15 @@ def test_apply_writes_new_file_header(tmp_path: Path) -> None:
 # ---------- 人物标注 ----------
 
 
+def test_chinese_char_count() -> None:
+    assert core.chinese_char_count("") == 0
+    assert core.chinese_char_count("abc 123 ,.?") == 0  # 无汉字
+    assert core.chinese_char_count("，。！？") == 0  # 中文标点不算汉字
+    assert core.chinese_char_count("好的") == 2
+    assert core.chinese_char_count("喜乐今天KET考试考得不错！") == 10  # 字母标点不计，恰好 10 个
+    assert core.chinese_char_count("步骤(1): 先做喜乐的复习计划") == 11
+
+
 def test_chat_message_people_default() -> None:
     msg = _msg("2026-07-22 20:16:11", "内容A")
     assert msg.people == []

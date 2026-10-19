@@ -32,6 +32,8 @@ CONFIG_PATH = Path(__file__).with_name("llm_config.json")
 # 分类缓存：同一消息上次分析过就不再调 LLM，用户确认过的目录直接沿用
 CACHE_PATH = Path(__file__).with_name("classify_cache.json")
 UNCLASSIFIED = "未分类"
+# 展示下限：汉字不足 10 个的行（无中文/超短消息/数字/链接/系统附件等）加载时直接过滤
+MIN_CHINESE_CHARS = 10
 
 
 def load_llm_config() -> dict:
@@ -221,6 +223,14 @@ class ChatSorterApp(tk.Tk):
             messagebox.showerror("加载失败", str(exc))
             return False
 
+        # 过滤：没有汉字或汉字不足 10 个的行（数字/链接/超短消息/系统附件等）不展示、不分析、不写入
+        total = len(messages)
+        messages = [
+            m for m in messages
+            if core.chinese_char_count(m.content) >= MIN_CHINESE_CHARS
+        ]
+        filtered = total - len(messages)
+
         cache_data = core.load_cache_data(CACHE_PATH)
         self._cache = cache_data["entries"]
         self._custom_people = cache_data["people"]
@@ -243,8 +253,9 @@ class ChatSorterApp(tk.Tk):
         self.dir_combo.configure(state="readonly")
         self.apply_btn.configure(state="normal")
         self.status_var.set(
-            f"已加载 {len(messages)} 条消息、{len(candidates)} 个候选目录。"
-            "双击行弹出内容详情并可修改“涉及人物”；点“分 析”让 LLM 结合人物推荐目录。"
+            f"已加载 {len(messages)} 条消息、{len(candidates)} 个候选目录"
+            + (f"（已过滤 {filtered} 条汉字不足 {MIN_CHINESE_CHARS} 个的行）。" if filtered else "。")
+            + "双击行弹出内容详情并可修改“涉及人物”；点“分 析”让 LLM 结合人物推荐目录。"
         )
         return True
 
