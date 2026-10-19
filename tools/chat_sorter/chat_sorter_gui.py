@@ -14,6 +14,7 @@ import queue
 import threading
 import time
 import tkinter as tk
+from datetime import date, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
@@ -126,6 +127,9 @@ class ChatSorterApp(tk.Tk):
         ttk.Label(out_row, text="目录深度:").pack(side="left", padx=(14, 0))
         self.depth_var = tk.IntVar(value=int(cfg.get("max_depth", 1)))
         ttk.Spinbox(out_row, from_=1, to=5, textvariable=self.depth_var, width=5).pack(side="left", padx=3)
+        ttk.Label(out_row, text="只加载最近(天，0=全部):").pack(side="left", padx=(14, 0))
+        self.recent_var = tk.IntVar(value=int(cfg.get("recent_days", 0)))
+        ttk.Spinbox(out_row, from_=0, to=3650, textvariable=self.recent_var, width=6).pack(side="left", padx=3)
         self.load_btn = ttk.Button(out_row, text="加 载", command=self._load_data)
         self.load_btn.pack(side="left", padx=(18, 4))
         self.analyze_btn = ttk.Button(out_row, text="分 析", command=self._start_analysis)
@@ -230,12 +234,21 @@ class ChatSorterApp(tk.Tk):
             messagebox.showerror("缺少素材根目录", "请先选择有效的素材根目录。")
             return False
         depth = max(1, min(5, int(self.depth_var.get() or 1)))
+        recent_days = max(0, int(self.recent_var.get() or 0))
         try:
             messages = core.parse_chat_txt(src)
             candidates = core.scan_candidate_dirs(root, max_depth=depth)
         except Exception as exc:
             messagebox.showerror("加载失败", str(exc))
             return False
+
+        # 只加载最近 N 天（0=全部）：按消息日期（含当天）往前推 N 天，更早的不展示、不分析、不写入
+        recent_dropped = 0
+        if recent_days:
+            cutoff = (date.today() - timedelta(days=recent_days - 1)).isoformat()
+            before = len(messages)
+            messages = [m for m in messages if m.time_str[:10] >= cutoff]
+            recent_dropped = before - len(messages)
 
         # 过滤：没有汉字或汉字不足 10 个的行（数字/链接/超短消息/系统附件等）不展示、不分析、不写入
         total = len(messages)
@@ -262,7 +275,7 @@ class ChatSorterApp(tk.Tk):
             for m in messages
         ]
         self._msg_index = {id(m): i for i, m in enumerate(messages)}
-        self._loaded_sig = (src, root, depth)
+        self._loaded_sig = (src, root, depth, recent_days)
         self._populate_rows_initial()
 
         self.dir_combo.configure(values=[UNCLASSIFIED, DISCARDED] + list(self.cand_by_display))
@@ -272,6 +285,7 @@ class ChatSorterApp(tk.Tk):
         discarded_cnt = sum(1 for a in self.assignments if a["discarded"])
         self.status_var.set(
             f"已加载 {len(messages)} 条消息、{len(candidates)} 个候选目录"
+            + (f"（最近 {recent_days} 天外已过滤 {recent_dropped} 条）" if recent_dropped else "")
             + (f"（已过滤 {filtered} 条汉字不足 {MIN_CHINESE_CHARS} 个的行）" if filtered else "")
             + (f"，其中废弃 {discarded_cnt} 条" if discarded_cnt else "")
             + "。双击行弹出内容详情并可修改“涉及人物”；右击行可标记/取消废弃；点“分 析”让 LLM 结合人物推荐目录。"
@@ -417,8 +431,9 @@ class ChatSorterApp(tk.Tk):
             messagebox.showerror("缺少 API 密钥", "请先填写 LLM API 密钥（OpenAI 兼容服务）。")
             return
         depth = max(1, min(5, int(self.depth_var.get() or 1)))
-        if self._loaded_sig != (src, root, depth) and not self._load_data():
-            return  # 首次或源/根目录/深度变了：先加载展示，再开始分析
+        recent_days = max(0, int(self.recent_var.get() or 0))
+        if self._loaded_sig != (src, root, depth, recent_days) and not self._load_data():
+            return  # 首次或源/根目录/深度/天数变了：先加载展示，再开始分析
         cfg = {
             "source": src,
             "root": root,
@@ -428,6 +443,7 @@ class ChatSorterApp(tk.Tk):
             "concurrency": max(1, min(8, int(self.conc_var.get() or 4))),
             "batch_size": max(5, min(50, int(self.batch_var.get() or 20))),
             "max_depth": depth,
+            "recent_days": recent_days,
             "output_name": self.out_var.get().strip(),
         }
         save_llm_config(cfg)
