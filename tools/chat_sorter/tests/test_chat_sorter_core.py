@@ -190,6 +190,106 @@ def test_classify_with_llm_retry_then_fail(tmp_path: Path) -> None:
     assert "LLM 调用失败 1 条" in core.summarize(results)
 
 
+def test_message_key_stable() -> None:
+    a = _msg("2026-07-22 20:16:11", "内容A")
+    b = _msg("2026-07-22 20:16:11", "内容A")
+    c = _msg("2026-07-22 20:16:11", "内容B")
+    d = _msg("2026-07-22 20:16:12", "内容A")
+    assert core.message_key(a) == core.message_key(b)
+    assert core.message_key(a) != core.message_key(c)
+    assert core.message_key(a) != core.message_key(d)
+
+
+def test_cache_save_load_roundtrip(tmp_path: Path) -> None:
+    path = tmp_path / "classify_cache.json"
+    cache = {
+        core.message_key(_msg("2026-07-22 20:16:11", "x")): {
+            "dir": "喜乐", "reason": "提到喜乐", "confirmed": True
+        }
+    }
+    core.save_cache(path, cache)
+    assert core.load_cache(path) == cache
+    # 损坏文件返回空而不是抛异常
+    path.write_text("{bad json", encoding="utf-8")
+    assert core.load_cache(path) == {}
+
+
+def test_cache_lookup_variants(tmp_path: Path) -> None:
+    candidates = _make_candidates(tmp_path)
+    cand_index = {core.display_rel(c): c for c in candidates}
+    msg = _msg("2026-07-22 20:16:11", "内容A")
+    key = core.message_key(msg)
+
+    # 未确认缓存命中：沿用上次目录与理由
+    cache = {key: {"dir": "喜乐", "reason": "提到喜乐", "confirmed": False}}
+    hit = core.cache_lookup(cache, msg, cand_index)
+    assert hit is not None and hit.candidate is not None
+    assert hit.candidate.rel_display == "喜乐"
+    assert hit.reason == "上次分析：提到喜乐"
+
+    # 已确认缓存：显示确认过的目录
+    cache[key]["confirmed"] = True
+    hit2 = core.cache_lookup(cache, msg, cand_index)
+    assert hit2 is not None and hit2.candidate is not None
+    assert "上次已确认写入" in hit2.reason
+
+    # 上次目录已不存在：缓存失效，需重新分析
+    cache[key] = {"dir": "不存在的目录", "reason": "r", "confirmed": False}
+    assert core.cache_lookup(cache, msg, cand_index) is None
+
+    # 未分类缓存（dir 为空）也命中，避免重复分析
+    cache[key] = {"dir": "", "reason": "LLM判断为未分类", "confirmed": False}
+    hit3 = core.cache_lookup(cache, msg, cand_index)
+    assert hit3 is not None and hit3.candidate is None
+    assert hit3.reason == "上次分析：LLM判断为未分类"
+
+    # 无缓存
+    assert core.cache_lookup({}, msg, cand_index) is None
+
+
+def test_classify_with_llm_uses_cache(tmp_path: Path) -> None:
+    candidates = _make_candidates(tmp_path)
+    cached_msg = _msg("2026-07-22 20:16:11", "喜乐今天KET考得不错")
+    fresh_msg = _msg("2026-07-22 20:20:00", "给老爸带的茶叶到了")
+    cache = {
+        core.message_key(cached_msg): {"dir": "喜乐", "reason": "上次理由", "confirmed": False}
+    }
+    calls = []
+
+    def fake_call(llm_messages: list[dict]) -> str:
+        calls.append(llm_messages)
+        return '{"results":[{"index":1,"dir":"老爸","reason":"给老爸带的"}]}'
+
+    results = core.classify_with_llm(
+        [cached_msg, fresh_msg], candidates, call_llm=fake_call, cache=cache
+    )
+    # 缓存命中的消息不再发给 LLM，只有新消息进批
+    assert len(calls) == 1
+    assert "喜乐今天KET考得不错" not in str(calls[0])
+    assert "茶叶到了" in str(calls[0])
+    # 命中结果沿用缓存目录
+    assert results[0].candidate is not None and results[0].candidate.rel_display == "喜乐"
+    assert results[0].reason == "上次分析：上次理由"
+    # 新结果写回缓存（未确认）
+    entry = cache[core.message_key(fresh_msg)]
+    assert entry["dir"] == "老爸" and entry["confirmed"] is False
+
+
+def test_classify_with_llm_cancel_no_cache_pollution(tmp_path: Path) -> None:
+    candidates = _make_candidates(tmp_path)
+    messages = [_msg("2026-07-22 20:16:11", "随便聊聊天气")]
+    cancel_event = threading.Event()
+    cancel_event.set()
+    cache: dict = {}
+
+    results = core.classify_with_llm(
+        messages, candidates, call_llm=lambda m: '{"results":[]}',
+        cancel_event=cancel_event, cache=cache,
+    )
+    assert all(r.reason == "已取消" for r in results)
+    assert not cache  # 取消的结果不进缓存，下次仍会正常分析
+
+
 def test_apply_writes_dedupe_and_append(tmp_path: Path) -> None:
     person = tmp_path / "喜乐"
     person.mkdir()

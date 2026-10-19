@@ -27,6 +27,8 @@ DEFAULT_OUTPUT = "微信聊天记录.txt"
 DEFAULT_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 DEFAULT_MODEL = "glm-4.6"
 CONFIG_PATH = Path(__file__).with_name("llm_config.json")
+# 分类缓存：同一消息上次分析过就不再调 LLM，用户确认过的目录直接沿用
+CACHE_PATH = Path(__file__).with_name("classify_cache.json")
 UNCLASSIFIED = "未分类"
 
 
@@ -62,6 +64,7 @@ class ChatSorterApp(tk.Tk):
         self._analysis_started: float = 0.0  # 本轮分析开始时刻（monotonic），用于显示已用秒数
         self._msg_index: dict[int, int] = {}  # id(消息) -> 行号，用于把批次结果映射回表格行
         self._noise_count = 0  # 系统/附件消息数（分析开始即已知，无需等 LLM）
+        self._cache: dict = {}  # 分类缓存（分析开始时从磁盘加载，确认写入后更新）
         cfg = load_llm_config()
 
         self._build_ui(cfg)
@@ -227,8 +230,9 @@ class ChatSorterApp(tk.Tk):
         try:
             messages = core.parse_chat_txt(cfg["source"])
             candidates = core.scan_candidate_dirs(cfg["root"], max_depth=cfg.get("max_depth"))
-            # 解析完成即预建表格：每完成一批就实时刷新对应行，不用等全部跑完
-            self._queue.put(("start", messages, candidates))
+            cache = core.load_cache(CACHE_PATH)
+            # 解析完成即预建表格：缓存命中的行直接定稿，其余每批实时刷新
+            self._queue.put(("start", messages, candidates, cache))
 
             def call_llm(llm_messages: list[dict]) -> str:
                 return core.openai_chat_call(
@@ -245,7 +249,9 @@ class ChatSorterApp(tk.Tk):
                     ("progress", done, total, failed, chunk)
                 ),
                 cancel_event=self._cancel_event,
+                cache=cache,
             )
+            core.save_cache(CACHE_PATH, cache)  # 本轮新结果落盘，下次不再重复分析
             self._queue.put(("done", results))
         except Exception as exc:
             self._queue.put(("error", str(exc)))
@@ -256,7 +262,7 @@ class ChatSorterApp(tk.Tk):
                 item = self._queue.get_nowait()
                 kind = item[0]
                 if kind == "start":
-                    self._on_analysis_start(item[1], item[2])
+                    self._on_analysis_start(item[1], item[2], item[3])
                 elif kind == "progress":
                     self._on_batch_progress(item[1], item[2], item[3], item[4])
                 elif kind == "done":
@@ -267,8 +273,9 @@ class ChatSorterApp(tk.Tk):
             pass
         self.after(100, self._poll_queue)
 
-    def _on_analysis_start(self, messages, candidates) -> None:
-        """解析完成后预建全部行：系统/附件行直接定稿，其余显示“分析中…”。"""
+    def _on_analysis_start(self, messages, candidates, cache) -> None:
+        """解析完成后预建全部行：系统/附件与缓存命中的行直接定稿，其余“分析中…”。"""
+        self._cache = cache
         self.candidates = candidates
         self.cand_by_display = {core.display_rel(c): c for c in candidates}
         self.assignments = [{"message": m, "result": None, "target": None} for m in messages]
@@ -276,12 +283,27 @@ class ChatSorterApp(tk.Tk):
         self._noise_count = sum(1 for m in messages if core.is_noise_content(m.content))
 
         self.tree.delete(*self.tree.get_children())
+        cached_hits = 0
         for i, item in enumerate(self.assignments):
             msg = item["message"]
             preview = msg.content.replace("\\n", " ")
             if len(preview) > 70:
                 preview = preview[:70] + "…"
-            if core.is_noise_content(msg.content):
+            hit = None
+            if not core.is_noise_content(msg.content):
+                hit = core.cache_lookup(cache, msg, self.cand_by_display)
+            if hit is not None:
+                # 缓存命中：上次分析过（或已确认写入）直接显示，不再调 LLM
+                item["result"] = hit
+                item["target"] = hit.candidate
+                cached_hits += 1
+                values = (
+                    i + 1, msg.time_str, preview,
+                    core.display_rel(hit.candidate) if hit.candidate else UNCLASSIFIED,
+                    hit.reason,
+                )
+                tag = () if hit.candidate else "unmatched"
+            elif core.is_noise_content(msg.content):
                 values = (i + 1, msg.time_str, preview, UNCLASSIFIED, "系统/附件消息，自动跳过")
                 tag = "noise"
             else:
@@ -291,6 +313,8 @@ class ChatSorterApp(tk.Tk):
 
         self.dir_combo.configure(values=[UNCLASSIFIED] + list(self.cand_by_display))
         self.dir_combo.set(UNCLASSIFIED)
+        todo = len(self.assignments) - cached_hits - self._noise_count
+        self.status_var.set(f"已命中缓存 {cached_hits} 条，本次需 LLM 分析 {todo} 条…")
 
     def _tag_for_result(self, res) -> tuple:
         if core.is_noise_content(res.message.content):
@@ -407,6 +431,19 @@ class ChatSorterApp(tk.Tk):
         self.result_text.insert("1.0", "\n".join(lines))
         self.result_text.configure(state="disabled")
         self.status_var.set(f"写入完成：{total_written} 条新消息，重复行已自动跳过。")
+        # 已写入的消息记入缓存：下次分析直接显示确认过的目录，不再调 LLM
+        for item in self.assignments:
+            if item["target"] is None:
+                continue
+            key = core.message_key(item["message"])
+            old = self._cache.get(key)
+            old_reason = str(old.get("reason") or "") if isinstance(old, dict) else ""
+            self._cache[key] = {
+                "dir": core.display_rel(item["target"]),
+                "reason": old_reason,
+                "confirmed": True,
+            }
+        core.save_cache(CACHE_PATH, self._cache)
 
     def _show_detail(self, _event) -> None:
         selected = self.tree.selection()

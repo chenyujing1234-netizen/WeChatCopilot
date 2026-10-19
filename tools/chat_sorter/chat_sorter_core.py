@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -228,6 +229,53 @@ def openai_chat_call(
     return body["choices"][0]["message"]["content"]
 
 
+# ---------- 分类缓存（跨会话复用，同一消息不重复分析） ----------
+
+CACHE_VERSION = 1
+
+
+def message_key(msg: ChatMessage) -> str:
+    """消息的稳定键：时间+发送者+内容 的哈希（与行号无关，导出新增消息也不受影响）。"""
+    raw = f"{msg.time_str}|{msg.sender_username}|{msg.content}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def load_cache(path: str | os.PathLike) -> dict:
+    """读取分类缓存 {key: {"dir","reason","confirmed"}}，缺失或损坏返回空 dict。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    entries = data.get("entries") if isinstance(data, dict) else None
+    return entries if isinstance(entries, dict) else {}
+
+
+def save_cache(path: str | os.PathLike, cache: dict) -> None:
+    """原子写入分类缓存（先写临时文件再整体替换）。"""
+    tmp = f"{os.fspath(path)}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"version": CACHE_VERSION, "entries": cache}, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def cache_lookup(cache: dict, msg: ChatMessage, cand_index: dict) -> ClassifyResult | None:
+    """命中缓存则返回对应分类结果（已确认的用确认目录），失效或未命中返回 None。"""
+    entry = cache.get(message_key(msg))
+    if not isinstance(entry, dict):
+        return None
+    dir_name = str(entry.get("dir") or "")
+    cand = cand_index.get(dir_name) if dir_name else None
+    if dir_name and cand is None:
+        return None  # 上次推荐的目录已不存在，缓存失效需重新分析
+    reason = str(entry.get("reason") or "")
+    if entry.get("confirmed"):
+        reason = "上次已确认写入" + (f"：{reason}" if reason else "")
+    else:
+        reason = f"上次分析：{reason}" if reason else "上次分析：未分类"
+    return ClassifyResult(message=msg, candidate=cand, reason=reason)
+
+
 def classify_with_llm(
     messages: list[ChatMessage],
     candidates: list[CandidateDir],
@@ -237,26 +285,34 @@ def classify_with_llm(
     concurrency: int = 4,
     progress_cb=None,
     cancel_event: threading.Event | None = None,
+    cache: dict | None = None,
 ) -> list[ClassifyResult]:
     """用 LLM 批量判断每条消息的归属目录。
 
     - 系统/附件消息不发送 LLM，直接标“系统/附件”；
+    - cache 非空时，命中缓存的消息直接沿用上次结果（用户确认过的用确认目录），不再调 LLM；
     - 其余消息按 batch_size 分批，concurrency 个线程并发调用 call_llm；
     - 每批失败自动重试 2 次，仍失败则该批消息标“LLM调用失败”（不中断整体）；
     - cancel_event 置位后，未开始的批不再调用 LLM，相关消息标“已取消”；
+    - 本轮新的有效 LLM 结果会写回 cache（失败/取消/无效目录不写），由调用方负责落盘；
     - progress_cb(done, total, failed, chunk) 在每批完成后回调（在 worker 线程中执行），
       failed 为累计失败批数（重试耗尽），chunk 为本批的 ClassifyResult 列表，
       可用于把已完成的结果实时显示到界面。
     """
+    cand_index = {display_rel(c): c for c in candidates}
     results: list[ClassifyResult | None] = [None] * len(messages)
     todo_idx: list[int] = []
     for i, msg in enumerate(messages):
         if is_noise_content(msg.content):
             results[i] = ClassifyResult(message=msg, reason="系统/附件消息，自动跳过")
-        else:
-            todo_idx.append(i)
+            continue
+        if cache is not None:
+            hit = cache_lookup(cache, msg, cand_index)
+            if hit is not None:
+                results[i] = hit
+                continue
+        todo_idx.append(i)
 
-    cand_index = {display_rel(c): c for c in candidates}
     batches = [todo_idx[k : k + batch_size] for k in range(0, len(todo_idx), batch_size)]
     total = len(batches)
     done = 0
@@ -284,25 +340,39 @@ def classify_with_llm(
                     last_error = exc
                     time.sleep(1.5 * (attempt + 1))
         out: list[ClassifyResult] = []
+        cache_worthy: list[bool] = []  # 只有有效结果才进缓存（失败/取消/无效目录不进）
         for n, gi in enumerate(indices, start=1):
             if is_cancelled:
                 out.append(ClassifyResult(message=messages[gi], reason="已取消"))
+                cache_worthy.append(False)
                 continue
             if parsed is None:
                 out.append(
                     ClassifyResult(message=messages[gi], reason=f"LLM调用失败：{last_error}")
                 )
+                cache_worthy.append(False)
                 continue
             dir_name, reason = parsed.get(n, ("", ""))
             cand = cand_index.get(dir_name) if dir_name else None
+            invalid_dir = False
             if dir_name and cand is None:
                 reason = f"LLM返回了无效目录“{dir_name}”，未采纳"
+                invalid_dir = True
             elif not cand and not reason:
                 reason = "LLM判断为未分类"
             out.append(ClassifyResult(message=messages[gi], candidate=cand, reason=reason))
+            cache_worthy.append(not invalid_dir)
         with lock:
             for gi, res in zip(indices, out):
                 results[gi] = res
+            if cache is not None:
+                for res, ok in zip(out, cache_worthy):
+                    if ok:
+                        cache[message_key(res.message)] = {
+                            "dir": display_rel(res.candidate) if res.candidate else "",
+                            "reason": res.reason,
+                            "confirmed": False,
+                        }
             done += 1
             if parsed is None and not is_cancelled:
                 failed_batches += 1
