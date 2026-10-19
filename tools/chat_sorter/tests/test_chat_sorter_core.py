@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 from pathlib import Path
@@ -379,7 +380,22 @@ def test_cache_data_people_roundtrip(tmp_path: Path) -> None:
     assert core.load_cache(path) == entries  # 兼容旧调用方
     # 损坏文件返回空结构
     path.write_text("not json", encoding="utf-8")
-    assert core.load_cache_data(path) == {"people": [], "msg_people": {}, "entries": {}}
+    assert core.load_cache_data(path) == {
+        "people": [], "msg_people": {}, "msg_discarded": {}, "entries": {}
+    }
+
+
+def test_cache_data_discarded_roundtrip(tmp_path: Path) -> None:
+    path = tmp_path / "classify_cache.json"
+    msg = _msg("2026-07-22 20:16:11", "内容A")
+    key = core.message_key(msg)
+    core.save_cache(path, {}, msg_discarded={key: True, "k2": False})
+    data = core.load_cache_data(path)
+    # True=手动废弃，False=保留系统/附件行，两种标记都要原样往返
+    assert data["msg_discarded"] == {key: True, "k2": False}
+    # 旧缓存文件（无 msg_discarded 字段）：返回空 dict，不报错
+    path.write_text(json.dumps({"version": 2, "entries": {}}), encoding="utf-8")
+    assert core.load_cache_data(path)["msg_discarded"] == {}
 
 
 def test_cache_lookup_people_mismatch(tmp_path: Path) -> None:

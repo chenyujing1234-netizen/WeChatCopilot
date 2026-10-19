@@ -32,6 +32,8 @@ CONFIG_PATH = Path(__file__).with_name("llm_config.json")
 # 分类缓存：同一消息上次分析过就不再调 LLM，用户确认过的目录直接沿用
 CACHE_PATH = Path(__file__).with_name("classify_cache.json")
 UNCLASSIFIED = "未分类"
+# 废弃状态：系统/附件消息自动废弃 + 手动标为废弃；废弃行不分析、不写入
+DISCARDED = "数据废弃"
 # 展示下限：汉字不足 10 个的行（无中文/超短消息/数字/链接/系统附件等）加载时直接过滤
 MIN_CHINESE_CHARS = 10
 
@@ -67,10 +69,11 @@ class ChatSorterApp(tk.Tk):
         self._cancel_event: threading.Event | None = None  # 分析运行中的取消信号
         self._analysis_started: float = 0.0  # 本轮分析开始时刻（monotonic），用于显示已用秒数
         self._msg_index: dict[int, int] = {}  # id(消息) -> 行号，用于把批次结果映射回表格行
-        self._noise_count = 0  # 系统/附件消息数（分析开始即已知，无需等 LLM）
+        self._row_count = 0  # 上次填充的行数（detach 隐藏的行清表时也要删掉）
         self._cache: dict = {}  # 分类缓存 entries（加载时从磁盘读取）
         self._custom_people: list[str] = []  # 用户新增的列表外人物（持久化在缓存文件）
         self._msg_people: dict[str, list[str]] = {}  # message_key -> 人物标注（持久化，重启后恢复）
+        self._msg_discarded: dict[str, bool] = {}  # message_key -> 废弃标记（持久化；False=保留系统/附件行）
         self._loaded_sig: tuple | None = None  # 已加载数据的 (源文件, 根目录, 深度)
         self._dir_editor: ttk.Combobox | None = None  # 行内目录编辑器（双击“推荐目录”列出现）
         cfg = load_llm_config()
@@ -146,6 +149,12 @@ class ChatSorterApp(tk.Tk):
         ttk.Button(
             assign, text="全不选", command=lambda: self.tree.selection_remove(self.tree.selection())
         ).pack(side="left")
+        # 隐藏废弃项：勾选后表格中不显示已废弃（系统/附件 + 手动标记）的行
+        self.hide_discarded_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            assign, text="隐藏废弃项", variable=self.hide_discarded_var,
+            command=self._apply_hide_discarded,
+        ).pack(side="left", padx=(12, 0))
 
         # 列表区：先建容器，Treeview 必须以容器为父级，
         # 否则列表会被排到主窗口底部，中间只剩一片空白
@@ -235,6 +244,7 @@ class ChatSorterApp(tk.Tk):
         self._cache = cache_data["entries"]
         self._custom_people = cache_data["people"]
         self._msg_people = cache_data["msg_people"]
+        self._msg_discarded = cache_data["msg_discarded"]
         for m in messages:  # 恢复上次标注的人物
             key = core.message_key(m)
             if key in self._msg_people:
@@ -242,26 +252,42 @@ class ChatSorterApp(tk.Tk):
 
         self.candidates = candidates
         self.cand_by_display = {core.display_rel(c): c for c in candidates}
-        self.assignments = [{"message": m, "result": None, "target": None} for m in messages]
+        self.assignments = [
+            {"message": m, "result": None, "target": None, "discarded": self._is_discarded(m)}
+            for m in messages
+        ]
         self._msg_index = {id(m): i for i, m in enumerate(messages)}
-        self._noise_count = sum(1 for m in messages if core.is_noise_content(m.content))
         self._loaded_sig = (src, root, depth)
         self._populate_rows_initial()
 
-        self.dir_combo.configure(values=[UNCLASSIFIED] + list(self.cand_by_display))
+        self.dir_combo.configure(values=[UNCLASSIFIED, DISCARDED] + list(self.cand_by_display))
         self.dir_combo.set(UNCLASSIFIED)
         self.dir_combo.configure(state="readonly")
         self.apply_btn.configure(state="normal")
+        discarded_cnt = sum(1 for a in self.assignments if a["discarded"])
         self.status_var.set(
             f"已加载 {len(messages)} 条消息、{len(candidates)} 个候选目录"
-            + (f"（已过滤 {filtered} 条汉字不足 {MIN_CHINESE_CHARS} 个的行）。" if filtered else "。")
-            + "双击行弹出内容详情并可修改“涉及人物”；点“分 析”让 LLM 结合人物推荐目录。"
+            + (f"（已过滤 {filtered} 条汉字不足 {MIN_CHINESE_CHARS} 个的行）" if filtered else "")
+            + (f"，其中废弃 {discarded_cnt} 条" if discarded_cnt else "")
+            + "。双击行弹出内容详情并可修改“涉及人物”；点“分 析”让 LLM 结合人物推荐目录。"
         )
         return True
 
+    def _is_discarded(self, msg) -> bool:
+        """行是否废弃：手动标记（True=废弃 / False=保留）优先，否则系统/附件消息自动废弃。"""
+        flag = self._msg_discarded.get(core.message_key(msg))
+        if flag is not None:
+            return flag
+        return core.is_noise_content(msg.content)
+
     def _populate_rows_initial(self) -> None:
-        """把当前 assignments 全部填进表格：缓存命中/系统附件直接定稿，其余待分析。"""
-        self.tree.delete(*self.tree.get_children())
+        """把当前 assignments 全部填进表格：废弃/缓存命中直接定稿，其余待分析。"""
+        # 清空旧行：被“隐藏废弃项”detach 的行不在 get_children 里，需按旧行号逐个清掉
+        self.tree.delete(*self.tree.get_children(""))
+        for i in range(self._row_count):
+            if self.tree.exists(str(i)):
+                self.tree.delete(str(i))
+        self._row_count = len(self.assignments)
         cached_hits = 0
         for i, item in enumerate(self.assignments):
             msg = item["message"]
@@ -269,38 +295,99 @@ class ChatSorterApp(tk.Tk):
             if len(preview) > 70:
                 preview = preview[:70] + "…"
             people_text = "、".join(msg.people)
-            hit = None
-            if not core.is_noise_content(msg.content):
-                hit = core.cache_lookup(self._cache, msg, self.cand_by_display)
-            if hit is not None:
-                # 缓存命中：上次分析过（或已确认写入）直接显示，不再调 LLM
-                item["result"] = hit
-                item["target"] = hit.candidate
-                cached_hits += 1
-                values = (
-                    i + 1, msg.time_str, preview, people_text,
-                    core.display_rel(hit.candidate) if hit.candidate else UNCLASSIFIED,
-                    hit.reason,
+            if item["discarded"]:
+                reason = (
+                    "系统/附件消息，已废弃"
+                    if core.is_noise_content(msg.content) and not self._msg_discarded.get(core.message_key(msg))
+                    else "手动标为废弃"
                 )
-                tag = () if hit.candidate else "unmatched"
-            elif core.is_noise_content(msg.content):
-                values = (i + 1, msg.time_str, preview, people_text, UNCLASSIFIED, "系统/附件消息，自动跳过")
+                values = (i + 1, msg.time_str, preview, people_text, DISCARDED, reason)
                 tag = "noise"
             else:
-                values = (i + 1, msg.time_str, preview, people_text, "未分析", "")
-                tag = "pending"
+                hit = core.cache_lookup(self._cache, msg, self.cand_by_display)
+                if hit is not None:
+                    # 缓存命中：上次分析过（或已确认写入）直接显示，不再调 LLM
+                    item["result"] = hit
+                    item["target"] = hit.candidate
+                    cached_hits += 1
+                    values = (
+                        i + 1, msg.time_str, preview, people_text,
+                        core.display_rel(hit.candidate) if hit.candidate else UNCLASSIFIED,
+                        hit.reason,
+                    )
+                    tag = () if hit.candidate else "unmatched"
+                else:
+                    values = (i + 1, msg.time_str, preview, people_text, "未分析", "")
+                    tag = "pending"
             self.tree.insert("", "end", iid=str(i), values=values, tags=(tag,))
+        self._apply_hide_discarded()  # “隐藏废弃项”开关状态立即生效
         return cached_hits
 
     def _save_cache_file(self) -> None:
-        """把分类缓存、人物名单与消息人物标注整体落盘（失败不打断界面）。"""
+        """把分类缓存、人物名单、人物标注与废弃标记整体落盘（失败不打断界面）。"""
         try:
             core.save_cache(
                 CACHE_PATH, self._cache,
                 people=self._custom_people, msg_people=self._msg_people,
+                msg_discarded=self._msg_discarded,
             )
         except OSError:
             pass
+
+    def _set_row_discard(self, idx: int, iid: str, discarded: bool) -> None:
+        """标记/取消一行废弃：手动标记优先于系统/附件自动判定，并立即持久化。
+
+        废弃行不分析、不写入；取消废弃时，系统/附件行记录“保留”（False），
+        下次加载不再自动废弃，其余行删掉标记恢复默认判定。
+        """
+        item = self.assignments[idx]
+        msg = item["message"]
+        key = core.message_key(msg)
+        values = list(self.tree.item(iid, "values"))
+        if discarded:
+            item["discarded"] = True
+            item["target"] = None  # 废弃行不写入
+            self._msg_discarded[key] = True
+            values[4] = DISCARDED
+            values[5] = "手动标为废弃"
+            self.tree.item(iid, values=values, tags=("noise",))
+            if self.hide_discarded_var.get():
+                self.tree.detach(iid)  # “隐藏废弃项”打开时立即隐藏
+        else:
+            item["discarded"] = False
+            if core.is_noise_content(msg.content):
+                self._msg_discarded[key] = False  # 记住：这条系统/附件行保留
+            else:
+                self._msg_discarded.pop(key, None)
+            # 恢复上次结果（如有），否则回到待分析显示
+            if item["result"] is not None:
+                res = item["result"]
+                item["target"] = res.candidate
+                values[4] = core.display_rel(res.candidate) if res.candidate else UNCLASSIFIED
+                values[5] = res.reason
+                tags = self._tag_for_result(res)
+            else:
+                item["target"] = None
+                values[4] = "未分析"
+                values[5] = ""
+                tags = "pending"
+            self.tree.item(iid, values=values, tags=(tags,))
+            if iid not in self.tree.get_children(""):
+                self.tree.move(iid, "", idx)  # 曾被隐藏的行按原行号归位
+        self._save_cache_file()
+
+    def _apply_hide_discarded(self) -> None:
+        """按“隐藏废弃项”开关隐藏/恢复废弃行（detach 不删数据，可随时恢复）。"""
+        hide = self.hide_discarded_var.get()
+        visible = set(self.tree.get_children(""))
+        for i, item in enumerate(self.assignments):
+            iid = str(i)
+            if not item["discarded"]:
+                continue
+            if hide and iid in visible:
+                self.tree.detach(iid)
+            elif not hide and iid not in visible:
+                self.tree.move(iid, "", i)
 
     def _start_analysis(self) -> None:
         src = self.src_var.get().strip()
@@ -338,10 +425,14 @@ class ChatSorterApp(tk.Tk):
         self.confirm_btn.configure(state="disabled")
         self.apply_btn.configure(state="disabled")
         self.dir_combo.configure(state="disabled")
-        hits = sum(1 for a in self.assignments if a["result"] is not None)
-        todo = len(self.assignments) - self._noise_count - hits
-        self.status_var.set(f"已命中缓存 {hits} 条，本次需 LLM 分析 {todo} 条…")
-        messages = [item["message"] for item in self.assignments]
+        hits = sum(1 for a in self.assignments if a["result"] is not None and not a["discarded"])
+        discarded_cnt = sum(1 for a in self.assignments if a["discarded"])
+        todo = len(self.assignments) - hits - discarded_cnt
+        self.status_var.set(
+            f"已命中缓存 {hits} 条、废弃 {discarded_cnt} 条，本次需 LLM 分析 {todo} 条…"
+        )
+        # 废弃行不送 LLM：省调用，也保证结果只覆盖需要更新的行
+        messages = [item["message"] for item in self.assignments if not item["discarded"]]
         threading.Thread(
             target=self._analyze_worker, args=(cfg, messages, self.candidates), daemon=True
         ).start()
@@ -415,7 +506,7 @@ class ChatSorterApp(tk.Tk):
                 self._apply_result_to_row(idx, res)
         elapsed = max(0, int(time.monotonic() - self._analysis_started))
         extra = f"（{failed} 失败）" if failed else ""
-        shown = sum(1 for a in self.assignments if a["result"] is not None) + self._noise_count
+        shown = sum(1 for a in self.assignments if a["result"] is not None or a["discarded"])
         self.status_var.set(
             f"LLM 分类中：已完成 {done}/{total} 批{extra} · "
             f"已出结果 {shown}/{len(self.assignments)} 条 · 已用 {elapsed} 秒…"
@@ -427,7 +518,11 @@ class ChatSorterApp(tk.Tk):
         self.load_btn.configure(state="normal")
         # 中途失败：尚未出结果的行标“分析中止”，已出结果的行保持原样
         for i, item in enumerate(self.assignments):
-            if item["result"] is None and not core.is_noise_content(item["message"].content):
+            if (
+                item["result"] is None
+                and not item["discarded"]
+                and not core.is_noise_content(item["message"].content)
+            ):
                 values = list(self.tree.item(str(i), "values"))
                 values[4] = UNCLASSIFIED
                 values[5] = "分析中止"
@@ -439,16 +534,22 @@ class ChatSorterApp(tk.Tk):
         self._cancel_event = None
         self.analyze_btn.configure(text="分 析", command=self._start_analysis)
         self.load_btn.configure(state="normal")
-        # 用最终结果全量刷新一遍（补齐系统/附件行等所有行），保证与整体结果一致
-        for i, res in enumerate(results):
-            if i < len(self.assignments):
+        # 按消息键把结果映射回行（本次只送非废弃消息给 LLM，与行号不再一一对应）
+        res_by_key = {core.message_key(r.message): r for r in results}
+        for i, item in enumerate(self.assignments):
+            if item["discarded"]:
+                continue  # 废弃行保持“数据废弃”显示，不被结果覆盖
+            res = res_by_key.get(core.message_key(item["message"]))
+            if res is not None:
                 self._apply_result_to_row(i, res)
         self.dir_combo.configure(state="readonly")
         self.apply_btn.configure(state="normal")
         self.analyze_btn.configure(state="normal")
         self.confirm_btn.configure(state="normal")
+        discarded_cnt = sum(1 for a in self.assignments if a["discarded"])
         self.status_var.set(
             core.summarize(results)
+            + (f"  另有废弃 {discarded_cnt} 条（不分析、不写入）。" if discarded_cnt else "")
             + "  双击“推荐目录”单元格改目录；双击其他位置弹出内容详情，窗口内可修改“涉及人物”（改完再分析会把新人物考虑进去）。"
         )
         self._refresh_confirm_label()
@@ -551,11 +652,14 @@ class ChatSorterApp(tk.Tk):
             return
         x, y, w, h = bbox
         item = self.assignments[int(row)]
-        current = core.display_rel(item["target"]) if item["target"] else UNCLASSIFIED
+        current = (
+            DISCARDED if item["discarded"]
+            else (core.display_rel(item["target"]) if item["target"] else UNCLASSIFIED)
+        )
         editor = ttk.Combobox(
             self.tree,
             state="readonly",
-            values=[UNCLASSIFIED] + list(self.cand_by_display),
+            values=[UNCLASSIFIED, DISCARDED] + list(self.cand_by_display),
         )
         editor.set(current)
         editor.place(x=x, y=y, width=max(w, 200), height=h)
@@ -571,10 +675,16 @@ class ChatSorterApp(tk.Tk):
             return
         choice = self._dir_editor.get()
         self._end_dir_edit()
+        if choice == DISCARDED:
+            self._set_row_discard(int(row), row, True)
+            self._refresh_confirm_label()
+            return  # 标为废弃：不分析、不写入
         target = None if choice == UNCLASSIFIED else self.cand_by_display.get(choice)
         if choice != UNCLASSIFIED and target is None:
             return  # 只能从候选列表中选
         item = self.assignments[int(row)]
+        if item["discarded"]:
+            self._set_row_discard(int(row), row, False)  # 改回普通目录 = 取消废弃
         item["target"] = target
         values = list(self.tree.item(row, "values"))
         values[4] = core.display_rel(target) if target else UNCLASSIFIED
@@ -595,12 +705,19 @@ class ChatSorterApp(tk.Tk):
             messagebox.showinfo("未选择行", "请先在表格中选择要修改目标目录的消息行。")
             return
         choice = self.dir_var.get()
+        if choice == DISCARDED:  # 批量标废弃
+            for iid in selected:
+                self._set_row_discard(int(iid), iid, True)
+            self._refresh_confirm_label()
+            return
         target = None if choice == UNCLASSIFIED else self.cand_by_display.get(choice)
         if choice != UNCLASSIFIED and target is None:
             messagebox.showerror("无效目录", "请从下拉框中选择有效的目录。")
             return
         for iid in selected:
             item = self.assignments[int(iid)]
+            if item["discarded"]:
+                self._set_row_discard(int(iid), iid, False)  # 改回普通目录 = 取消废弃
             item["target"] = target
             values = list(self.tree.item(iid, "values"))
             values[4] = core.display_rel(target) if target else UNCLASSIFIED
@@ -615,15 +732,16 @@ class ChatSorterApp(tk.Tk):
         self.confirm_btn.configure(text=f"确认写入（{count} 条）")
 
     def _confirm_write(self) -> None:
+        discarded_cnt = sum(1 for item in self.assignments if item["discarded"])
         pairs = [(item["target"], item["message"]) for item in self.assignments if item["target"]]
-        unclassified = len(self.assignments) - len(pairs)
+        unclassified = len(self.assignments) - len(pairs) - discarded_cnt
         if not pairs:
             messagebox.showinfo("没有可写入的消息", "当前没有消息被指定到任何目录（未分类的消息不会写入）。")
             return
         out_name = core.sanitize_output_name(self.out_var.get())
         if not messagebox.askyesno(
             "确认写入",
-            f"即将把 {len(pairs)} 条消息追加写入到对应目录下的“{out_name}”（{unclassified} 条未分类将被跳过）。\n确定继续吗？",
+            f"即将把 {len(pairs)} 条消息追加写入到对应目录下的“{out_name}”（{unclassified} 条未分类、{discarded_cnt} 条废弃将被跳过）。\n确定继续吗？",
         ):
             return
         try:
@@ -674,9 +792,14 @@ class ChatSorterApp(tk.Tk):
         win = tk.Toplevel(self)
         win.title(f"消息详情 - {msg.time_str}")
         win.geometry("860x640")
+        dir_text = (
+            f"{DISCARDED}（已废弃：不分析、不写入）"
+            if item["discarded"]
+            else (core.display_rel(item["target"]) if item["target"] else UNCLASSIFIED)
+        )
         info = (
             f"时间: {msg.time_str}    发送者: {msg.sender_display} ({msg.sender_username})\n"
-            f"当前目标目录: {core.display_rel(item['target']) if item['target'] else UNCLASSIFIED}\n"
+            f"当前目标目录: {dir_text}\n"
             f"LLM 理由: {reason}"
         )
         ttk.Label(win, text=info, justify="left", padding=(12, 10, 12, 4)).pack(anchor="w")
