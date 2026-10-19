@@ -80,6 +80,8 @@ class ChatSorterApp(tk.Tk):
 
         self._build_ui(cfg)
         self.after(100, self._poll_queue)
+        # 启动时自动加载数据：界面先显示，再静默加载，无需手动点“加 载”
+        self.after(150, self._auto_load)
 
     # ---------- 界面搭建 ----------
 
@@ -275,6 +277,15 @@ class ChatSorterApp(tk.Tk):
             + "。双击行弹出内容详情并可修改“涉及人物”；右击行可标记/取消废弃；点“分 析”让 LLM 结合人物推荐目录。"
         )
         return True
+
+    def _auto_load(self) -> None:
+        """启动时自动加载：路径均有效就直接展示全部消息，无效则提示后由手动加载。"""
+        src = self.src_var.get().strip()
+        root = self.root_var.get().strip()
+        if not src or not Path(src).is_file() or not root or not Path(root).is_dir():
+            self.status_var.set("启动自动加载跳过：请设置有效的源文件与素材根目录后点“加 载”。")
+            return
+        self._load_data()
 
     def _is_discarded(self, msg) -> bool:
         """行是否废弃：手动标记（True=废弃 / False=保留）优先，否则系统/附件消息自动废弃。"""
