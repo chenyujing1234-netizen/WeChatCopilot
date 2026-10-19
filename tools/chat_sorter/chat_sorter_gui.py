@@ -177,6 +177,9 @@ class ChatSorterApp(tk.Tk):
         self.tree.tag_configure("unmatched", foreground="#b06000")
         self.tree.tag_configure("pending", foreground="#7a7aa0")  # 分析中、尚未出结果的行
         self.tree.bind("<Double-1>", self._on_tree_double_click)
+        # 右击行弹出“废弃/取消废弃”菜单（对全部选中行生效）
+        self.ctx_menu = tk.Menu(self, tearoff=0)
+        self.tree.bind("<Button-3>", self._on_tree_right_click)
         ybar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=ybar.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -269,7 +272,7 @@ class ChatSorterApp(tk.Tk):
             f"已加载 {len(messages)} 条消息、{len(candidates)} 个候选目录"
             + (f"（已过滤 {filtered} 条汉字不足 {MIN_CHINESE_CHARS} 个的行）" if filtered else "")
             + (f"，其中废弃 {discarded_cnt} 条" if discarded_cnt else "")
-            + "。双击行弹出内容详情并可修改“涉及人物”；点“分 析”让 LLM 结合人物推荐目录。"
+            + "。双击行弹出内容详情并可修改“涉及人物”；右击行可标记/取消废弃；点“分 析”让 LLM 结合人物推荐目录。"
         )
         return True
 
@@ -565,6 +568,32 @@ class ChatSorterApp(tk.Tk):
             self._begin_dir_edit(row)
         else:
             self._show_detail(row)
+
+    def _on_tree_right_click(self, event) -> None:
+        """右击行弹出菜单：废弃选中行；右击的是废弃行时提供“取消废弃”。"""
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return  # 空白/表头处不弹菜单
+        if row not in self.tree.selection():
+            self.tree.selection_set(row)  # 右击未选中的行时切换选中
+        self.ctx_menu.delete(0, "end")
+        if self.assignments[int(row)]["discarded"]:
+            self.ctx_menu.add_command(label="取消废弃", command=lambda: self._discard_selected(False))
+        else:
+            self.ctx_menu.add_command(label="废弃", command=lambda: self._discard_selected(True))
+        try:
+            self.ctx_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.ctx_menu.grab_release()
+
+    def _discard_selected(self, discarded: bool) -> None:
+        """把当前选中的行批量标记/取消废弃（右键菜单触发，立即持久化）。"""
+        if self._cancel_event is not None:
+            self.status_var.set("分析进行中，请等本轮结束后再修改废弃标记。")
+            return
+        for iid in self.tree.selection():
+            self._set_row_discard(int(iid), iid, discarded)
+        self._refresh_confirm_label()
 
     def _people_choices(self, extra: list[str] | None = None) -> list[str]:
         """人物候选名单：顶层候选目录名 + 用户新增人物 + 所有已标注过的人物。"""
