@@ -1,7 +1,9 @@
 """文件传输助手聊天分类工具——tkinter 界面。
 
-流程：确认源文件、素材根目录与 LLM 配置 -> 点“分析”（LLM 逐批判断，只推荐不写盘）
--> 在表格中查看/修改每条消息的目标目录 -> 点“确认写入”才真正写入。
+流程：选好源文件与素材根目录 -> 点“加载”先展示全部消息，双击“涉及人物”列
+标注聊天人物（从列表选择或新增）-> 点“分析”（LLM 把人物标注一并考虑，
+逐批推荐目录，只推荐不写盘）-> 在表格中查看/修改目标目录 -> 点“确认写入”
+把消息连同人物标注一起追加到各目录的 txt。
 LLM 配置保存在脚本旁的 llm_config.json，下次启动自动加载。
 """
 
@@ -64,7 +66,10 @@ class ChatSorterApp(tk.Tk):
         self._analysis_started: float = 0.0  # 本轮分析开始时刻（monotonic），用于显示已用秒数
         self._msg_index: dict[int, int] = {}  # id(消息) -> 行号，用于把批次结果映射回表格行
         self._noise_count = 0  # 系统/附件消息数（分析开始即已知，无需等 LLM）
-        self._cache: dict = {}  # 分类缓存（分析开始时从磁盘加载，确认写入后更新）
+        self._cache: dict = {}  # 分类缓存 entries（加载时从磁盘读取）
+        self._custom_people: list[str] = []  # 用户新增的列表外人物（持久化在缓存文件）
+        self._msg_people: dict[str, list[str]] = {}  # message_key -> 人物标注（持久化，重启后恢复）
+        self._loaded_sig: tuple | None = None  # 已加载数据的 (源文件, 根目录, 深度)
         self._dir_editor: ttk.Combobox | None = None  # 行内目录编辑器（双击“推荐目录”列出现）
         cfg = load_llm_config()
 
@@ -114,10 +119,14 @@ class ChatSorterApp(tk.Tk):
         ttk.Label(out_row, text="目录深度:").pack(side="left", padx=(14, 0))
         self.depth_var = tk.IntVar(value=int(cfg.get("max_depth", 1)))
         ttk.Spinbox(out_row, from_=1, to=5, textvariable=self.depth_var, width=5).pack(side="left", padx=3)
+        self.load_btn = ttk.Button(out_row, text="加 载", command=self._load_data)
+        self.load_btn.pack(side="left", padx=(18, 4))
         self.analyze_btn = ttk.Button(out_row, text="分 析", command=self._start_analysis)
-        self.analyze_btn.pack(side="left", padx=(18, 4))
+        self.analyze_btn.pack(side="left", padx=(0, 4))
 
-        self.status_var = tk.StringVar(value="填好 API 密钥后点击“分析”。分析只由 LLM 做推荐，不会写任何文件。")
+        self.status_var = tk.StringVar(
+            value="先点“加 载”展示全部消息，双击“涉及人物”列标注聊天人物，再点“分 析”让 LLM 推荐目录（分析不写任何文件）。"
+        )
         ttk.Label(self, textvariable=self.status_var, padding=(12, 2)).pack(fill="x")
 
         # 目录下拉行：放在列表上方，方便查看与批量修改
@@ -141,13 +150,14 @@ class ChatSorterApp(tk.Tk):
         tree_frame = ttk.Frame(self)
         tree_frame.pack(fill="both", expand=True, padx=10, pady=4)
 
-        columns = ("idx", "time", "preview", "dir", "reason")
+        columns = ("idx", "time", "preview", "people", "dir", "reason")
         self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="extended")
         for col, text, width, anchor in (
-            ("idx", "序号", 56, "e"),
-            ("time", "时间", 138, "w"),
-            ("preview", "内容预览", 430, "w"),
-            ("dir", "推荐目录（可修改）", 250, "w"),
+            ("idx", "序号", 52, "e"),
+            ("time", "时间", 132, "w"),
+            ("preview", "内容预览", 380, "w"),
+            ("people", "涉及人物（双击标注）", 140, "w"),
+            ("dir", "推荐目录（可修改）", 220, "w"),
             ("reason", "LLM 理由", 190, "w"),
         ):
             self.tree.heading(col, text=text)
@@ -186,6 +196,101 @@ class ChatSorterApp(tk.Tk):
         if path:
             self.root_var.set(path)
 
+    def _load_data(self) -> bool:
+        """解析源文件 + 扫描候选目录 + 读取人物标注缓存，先把所有数据展示到表格。
+
+        缓存命中的消息（上次分析过/已确认写入）直接定稿显示；分析前即可标注
+        “涉及人物”与手动指定目录。返回是否加载成功。
+        """
+        if self._cancel_event is not None:
+            messagebox.showinfo("分析进行中", "请等本轮分析结束后再重新加载数据。")
+            return False
+        src = self.src_var.get().strip()
+        root = self.root_var.get().strip()
+        if not src or not Path(src).is_file():
+            messagebox.showerror("缺少源文件", "请先选择有效的会话 txt 文件。")
+            return False
+        if not root or not Path(root).is_dir():
+            messagebox.showerror("缺少素材根目录", "请先选择有效的素材根目录。")
+            return False
+        depth = max(1, min(5, int(self.depth_var.get() or 1)))
+        try:
+            messages = core.parse_chat_txt(src)
+            candidates = core.scan_candidate_dirs(root, max_depth=depth)
+        except Exception as exc:
+            messagebox.showerror("加载失败", str(exc))
+            return False
+
+        cache_data = core.load_cache_data(CACHE_PATH)
+        self._cache = cache_data["entries"]
+        self._custom_people = cache_data["people"]
+        self._msg_people = cache_data["msg_people"]
+        for m in messages:  # 恢复上次标注的人物
+            key = core.message_key(m)
+            if key in self._msg_people:
+                m.people = list(self._msg_people[key])
+
+        self.candidates = candidates
+        self.cand_by_display = {core.display_rel(c): c for c in candidates}
+        self.assignments = [{"message": m, "result": None, "target": None} for m in messages]
+        self._msg_index = {id(m): i for i, m in enumerate(messages)}
+        self._noise_count = sum(1 for m in messages if core.is_noise_content(m.content))
+        self._loaded_sig = (src, root, depth)
+        self._populate_rows_initial()
+
+        self.dir_combo.configure(values=[UNCLASSIFIED] + list(self.cand_by_display))
+        self.dir_combo.set(UNCLASSIFIED)
+        self.dir_combo.configure(state="readonly")
+        self.apply_btn.configure(state="normal")
+        self.status_var.set(
+            f"已加载 {len(messages)} 条消息、{len(candidates)} 个候选目录。"
+            "双击“涉及人物”列可标注聊天人物；点“分 析”让 LLM 结合人物推荐目录。"
+        )
+        return True
+
+    def _populate_rows_initial(self) -> None:
+        """把当前 assignments 全部填进表格：缓存命中/系统附件直接定稿，其余待分析。"""
+        self.tree.delete(*self.tree.get_children())
+        cached_hits = 0
+        for i, item in enumerate(self.assignments):
+            msg = item["message"]
+            preview = msg.content.replace("\\n", " ")
+            if len(preview) > 70:
+                preview = preview[:70] + "…"
+            people_text = "、".join(msg.people)
+            hit = None
+            if not core.is_noise_content(msg.content):
+                hit = core.cache_lookup(self._cache, msg, self.cand_by_display)
+            if hit is not None:
+                # 缓存命中：上次分析过（或已确认写入）直接显示，不再调 LLM
+                item["result"] = hit
+                item["target"] = hit.candidate
+                cached_hits += 1
+                values = (
+                    i + 1, msg.time_str, preview, people_text,
+                    core.display_rel(hit.candidate) if hit.candidate else UNCLASSIFIED,
+                    hit.reason,
+                )
+                tag = () if hit.candidate else "unmatched"
+            elif core.is_noise_content(msg.content):
+                values = (i + 1, msg.time_str, preview, people_text, UNCLASSIFIED, "系统/附件消息，自动跳过")
+                tag = "noise"
+            else:
+                values = (i + 1, msg.time_str, preview, people_text, "未分析", "")
+                tag = "pending"
+            self.tree.insert("", "end", iid=str(i), values=values, tags=(tag,))
+        return cached_hits
+
+    def _save_cache_file(self) -> None:
+        """把分类缓存、人物名单与消息人物标注整体落盘（失败不打断界面）。"""
+        try:
+            core.save_cache(
+                CACHE_PATH, self._cache,
+                people=self._custom_people, msg_people=self._msg_people,
+            )
+        except OSError:
+            pass
+
     def _start_analysis(self) -> None:
         src = self.src_var.get().strip()
         root = self.root_var.get().strip()
@@ -199,6 +304,9 @@ class ChatSorterApp(tk.Tk):
         if not api_key:
             messagebox.showerror("缺少 API 密钥", "请先填写 LLM API 密钥（OpenAI 兼容服务）。")
             return
+        depth = max(1, min(5, int(self.depth_var.get() or 1)))
+        if self._loaded_sig != (src, root, depth) and not self._load_data():
+            return  # 首次或源/根目录/深度变了：先加载展示，再开始分析
         cfg = {
             "source": src,
             "root": root,
@@ -207,7 +315,7 @@ class ChatSorterApp(tk.Tk):
             "api_key": api_key,
             "concurrency": max(1, min(8, int(self.conc_var.get() or 4))),
             "batch_size": max(5, min(50, int(self.batch_var.get() or 20))),
-            "max_depth": max(1, min(5, int(self.depth_var.get() or 1))),
+            "max_depth": depth,
             "output_name": self.out_var.get().strip(),
         }
         save_llm_config(cfg)
@@ -215,11 +323,17 @@ class ChatSorterApp(tk.Tk):
         self._analysis_started = time.monotonic()
         # 运行中按钮变为“停止”，可随时中止剩余批次（已完成的结果仍然保留）
         self.analyze_btn.configure(text="停 止", command=self._cancel_analysis)
+        self.load_btn.configure(state="disabled")
         self.confirm_btn.configure(state="disabled")
         self.apply_btn.configure(state="disabled")
         self.dir_combo.configure(state="disabled")
-        self.status_var.set("正在解析消息与扫描目录…")
-        threading.Thread(target=self._analyze_worker, args=(cfg,), daemon=True).start()
+        hits = sum(1 for a in self.assignments if a["result"] is not None)
+        todo = len(self.assignments) - self._noise_count - hits
+        self.status_var.set(f"已命中缓存 {hits} 条，本次需 LLM 分析 {todo} 条…")
+        messages = [item["message"] for item in self.assignments]
+        threading.Thread(
+            target=self._analyze_worker, args=(cfg, messages, self.candidates), daemon=True
+        ).start()
 
     def _cancel_analysis(self) -> None:
         if self._cancel_event is not None:
@@ -227,14 +341,8 @@ class ChatSorterApp(tk.Tk):
         self.analyze_btn.configure(state="disabled")
         self.status_var.set("正在停止：等待进行中的 LLM 批次结束后，返回已完成的分类…")
 
-    def _analyze_worker(self, cfg: dict) -> None:
+    def _analyze_worker(self, cfg: dict, messages: list, candidates: list) -> None:
         try:
-            messages = core.parse_chat_txt(cfg["source"])
-            candidates = core.scan_candidate_dirs(cfg["root"], max_depth=cfg.get("max_depth"))
-            cache = core.load_cache(CACHE_PATH)
-            # 解析完成即预建表格：缓存命中的行直接定稿，其余每批实时刷新
-            self._queue.put(("start", messages, candidates, cache))
-
             def call_llm(llm_messages: list[dict]) -> str:
                 return core.openai_chat_call(
                     cfg["base_url"], cfg["api_key"], cfg["model"], llm_messages
@@ -250,9 +358,10 @@ class ChatSorterApp(tk.Tk):
                     ("progress", done, total, failed, chunk)
                 ),
                 cancel_event=self._cancel_event,
-                cache=cache,
+                cache=self._cache,
             )
-            core.save_cache(CACHE_PATH, cache)  # 本轮新结果落盘，下次不再重复分析
+            # 本轮新结果连同人物名单与标注落盘，下次不再重复分析
+            self._save_cache_file()
             self._queue.put(("done", results))
         except Exception as exc:
             self._queue.put(("error", str(exc)))
@@ -262,9 +371,7 @@ class ChatSorterApp(tk.Tk):
             while True:
                 item = self._queue.get_nowait()
                 kind = item[0]
-                if kind == "start":
-                    self._on_analysis_start(item[1], item[2], item[3])
-                elif kind == "progress":
+                if kind == "progress":
                     self._on_batch_progress(item[1], item[2], item[3], item[4])
                 elif kind == "done":
                     self._on_analysis_done(item[1])
@@ -273,49 +380,6 @@ class ChatSorterApp(tk.Tk):
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)
-
-    def _on_analysis_start(self, messages, candidates, cache) -> None:
-        """解析完成后预建全部行：系统/附件与缓存命中的行直接定稿，其余“分析中…”。"""
-        self._cache = cache
-        self.candidates = candidates
-        self.cand_by_display = {core.display_rel(c): c for c in candidates}
-        self.assignments = [{"message": m, "result": None, "target": None} for m in messages]
-        self._msg_index = {id(m): i for i, m in enumerate(messages)}
-        self._noise_count = sum(1 for m in messages if core.is_noise_content(m.content))
-
-        self.tree.delete(*self.tree.get_children())
-        cached_hits = 0
-        for i, item in enumerate(self.assignments):
-            msg = item["message"]
-            preview = msg.content.replace("\\n", " ")
-            if len(preview) > 70:
-                preview = preview[:70] + "…"
-            hit = None
-            if not core.is_noise_content(msg.content):
-                hit = core.cache_lookup(cache, msg, self.cand_by_display)
-            if hit is not None:
-                # 缓存命中：上次分析过（或已确认写入）直接显示，不再调 LLM
-                item["result"] = hit
-                item["target"] = hit.candidate
-                cached_hits += 1
-                values = (
-                    i + 1, msg.time_str, preview,
-                    core.display_rel(hit.candidate) if hit.candidate else UNCLASSIFIED,
-                    hit.reason,
-                )
-                tag = () if hit.candidate else "unmatched"
-            elif core.is_noise_content(msg.content):
-                values = (i + 1, msg.time_str, preview, UNCLASSIFIED, "系统/附件消息，自动跳过")
-                tag = "noise"
-            else:
-                values = (i + 1, msg.time_str, preview, "分析中…", "")
-                tag = "pending"
-            self.tree.insert("", "end", iid=str(i), values=values, tags=(tag,))
-
-        self.dir_combo.configure(values=[UNCLASSIFIED] + list(self.cand_by_display))
-        self.dir_combo.set(UNCLASSIFIED)
-        todo = len(self.assignments) - cached_hits - self._noise_count
-        self.status_var.set(f"已命中缓存 {cached_hits} 条，本次需 LLM 分析 {todo} 条…")
 
     def _tag_for_result(self, res) -> tuple:
         if core.is_noise_content(res.message.content):
@@ -328,8 +392,8 @@ class ChatSorterApp(tk.Tk):
         item["result"] = res
         item["target"] = res.candidate
         values = list(self.tree.item(str(idx), "values"))
-        values[3] = core.display_rel(res.candidate) if res.candidate else UNCLASSIFIED
-        values[4] = res.reason
+        values[4] = core.display_rel(res.candidate) if res.candidate else UNCLASSIFIED
+        values[5] = res.reason
         self.tree.item(str(idx), values=values, tags=(self._tag_for_result(res),))
 
     def _on_batch_progress(self, done: int, total: int, failed: int, chunk) -> None:
@@ -349,12 +413,13 @@ class ChatSorterApp(tk.Tk):
     def _on_analysis_failed(self, error: str) -> None:
         self._cancel_event = None
         self.analyze_btn.configure(text="分 析", command=self._start_analysis, state="normal")
+        self.load_btn.configure(state="normal")
         # 中途失败：尚未出结果的行标“分析中止”，已出结果的行保持原样
         for i, item in enumerate(self.assignments):
             if item["result"] is None and not core.is_noise_content(item["message"].content):
                 values = list(self.tree.item(str(i), "values"))
-                values[3] = UNCLASSIFIED
-                values[4] = "分析中止"
+                values[4] = UNCLASSIFIED
+                values[5] = "分析中止"
                 self.tree.item(str(i), values=values, tags=("unmatched",))
         self.status_var.set("分析失败，请检查路径与 API 配置后重试。")
         messagebox.showerror("分析失败", error)
@@ -362,6 +427,7 @@ class ChatSorterApp(tk.Tk):
     def _on_analysis_done(self, results) -> None:
         self._cancel_event = None
         self.analyze_btn.configure(text="分 析", command=self._start_analysis)
+        self.load_btn.configure(state="normal")
         # 用最终结果全量刷新一遍（补齐系统/附件行等所有行），保证与整体结果一致
         for i, res in enumerate(results):
             if i < len(self.assignments):
@@ -370,30 +436,133 @@ class ChatSorterApp(tk.Tk):
         self.apply_btn.configure(state="normal")
         self.analyze_btn.configure(state="normal")
         self.confirm_btn.configure(state="normal")
-        self.status_var.set(core.summarize(results) + "  双击行查看内容；双击“推荐目录”单元格可直接修改目标目录。")
+        self.status_var.set(
+            core.summarize(results)
+            + "  双击“推荐目录”改目录；双击“涉及人物”标注人物（改完再分析会把新人物考虑进去）；双击其他位置看详情。"
+        )
         self._refresh_confirm_label()
 
     def _on_tree_double_click(self, event) -> None:
-        """双击“推荐目录”列：行内下拉直接修改该行目录；其余位置打开消息详情。"""
-        if (
-            self.tree.identify("region", event.x, event.y) == "cell"
-            and self.tree.identify_column(event.x) == "#4"
-        ):
-            row = self.tree.identify_row(event.y)
-            if row:
-                self._begin_dir_edit(row)
+        """双击分发：#4“涉及人物”列开标注对话框，#5“推荐目录”列行内改目录，其余看详情。"""
+        if self.tree.identify("region", event.x, event.y) != "cell":
+            self._show_detail(event)
             return
-        self._show_detail(event)
+        col = self.tree.identify_column(event.x)
+        row = self.tree.identify_row(event.y)
+        if not row:
+            self._show_detail(event)
+            return
+        if col == "#4":
+            self._edit_people(row)
+        elif col == "#5":
+            self._begin_dir_edit(row)
+        else:
+            self._show_detail(event)
+
+    def _people_choices(self, extra: list[str] | None = None) -> list[str]:
+        """人物候选名单：顶层候选目录名 + 用户新增人物 + 所有已标注过的人物。"""
+        names = {c.rel_display for c in self.candidates if c.depth == 1}
+        names.update(self._custom_people)
+        for people in self._msg_people.values():
+            names.update(people)
+        if extra:
+            names.update(extra)
+        return sorted(names)
+
+    def _edit_people(self, row: str) -> None:
+        """双击“涉及人物”列：弹窗多选标注该消息的聊天人物，可新增列表外人物。"""
+        if self._cancel_event is not None:
+            self.status_var.set("分析进行中，请等本轮结束后再标注人物。")
+            return
+        if not self.assignments:
+            messagebox.showinfo("未加载数据", "请先点击“加 载”展示消息。")
+            return
+        item = self.assignments[int(row)]
+        msg = item["message"]
+        win = tk.Toplevel(self)
+        win.title(f"标注涉及人物 - 第 {int(row) + 1} 条")
+        win.geometry("360x430")
+        win.transient(self)
+        ttk.Label(win, text="勾选该消息涉及的聊天人物（可多选）：", padding=(10, 10, 10, 4)).pack(anchor="w")
+
+        list_frame = ttk.Frame(win)
+        list_frame.pack(fill="both", expand=True, padx=10)
+        listbox = tk.Listbox(list_frame, selectmode="multiple", exportselection=False)
+        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        listbox.configure(yscrollcommand=scroll.set)
+        listbox.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        def selected_names() -> set[str]:
+            return {listbox.get(i) for i in listbox.curselection()}
+
+        def refill(select: set[str]) -> None:
+            listbox.delete(0, "end")
+            for name in self._people_choices(sorted(select)):
+                listbox.insert("end", name)
+                if name in select:
+                    listbox.selection_set("end")
+
+        refill(set(msg.people))
+
+        add_row = ttk.Frame(win, padding=(10, 6))
+        add_row.pack(fill="x")
+        new_var = tk.StringVar()
+        entry = ttk.Entry(add_row, textvariable=new_var)
+        entry.pack(side="left", fill="x", expand=True)
+        entry.focus_set()
+
+        def add_person() -> None:
+            name = new_var.get().strip()
+            if not name:
+                return
+            if name not in self._custom_people and name not in {
+                c.rel_display for c in self.candidates if c.depth == 1
+            }:
+                self._custom_people.append(name)  # 列表外人物持久保存，下次仍在
+                self._save_cache_file()
+            entry.delete(0, "end")
+            refill(selected_names() | {name})
+            entry.focus_set()
+
+        ttk.Button(add_row, text="新增并勾选", command=add_person).pack(side="left", padx=(6, 0))
+        win.bind("<Return>", lambda _e: add_person())
+
+        btn_row = ttk.Frame(win, padding=(10, 6))
+        btn_row.pack()
+
+        def commit() -> None:
+            self._commit_people(row, sorted(selected_names()))
+            win.destroy()
+
+        ttk.Button(btn_row, text="确 定", command=commit).pack(side="left", padx=6)
+        ttk.Button(btn_row, text="取 消", command=win.destroy).pack(side="left", padx=6)
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+
+    def _commit_people(self, row: str, people: list[str]) -> None:
+        """把人物标注应用到消息、持久化缓存与表格行（由标注对话框“确定”调用）。"""
+        item = self.assignments[int(row)]
+        msg = item["message"]
+        msg.people = core.normalize_people(people)
+        self._msg_people[core.message_key(msg)] = list(msg.people)
+        self._save_cache_file()
+        values = list(self.tree.item(row, "values"))
+        values[3] = "、".join(msg.people)
+        self.tree.item(row, values=values)
+        self.status_var.set(
+            f"第 {int(row) + 1} 条消息已标注人物：{'、'.join(msg.people) or '无'}"
+            "（下次“分 析”会把这些人物考虑进去）"
+        )
 
     def _begin_dir_edit(self, row: str) -> None:
         if self._cancel_event is not None:
             self.status_var.set("分析进行中，请等本轮结束后再修改目录。")
             return
         if not self.cand_by_display:
-            messagebox.showinfo("无候选目录", "尚未扫描到候选目录，请先完成一次分析。")
+            messagebox.showinfo("无候选目录", "尚未扫描到候选目录，请先点击“加 载”。")
             return
         self._end_dir_edit()  # 同一时间只保留一个编辑器
-        bbox = self.tree.bbox(row, column="#4")
+        bbox = self.tree.bbox(row, column="#5")
         if not bbox:
             return
         x, y, w, h = bbox
@@ -424,8 +593,8 @@ class ChatSorterApp(tk.Tk):
         item = self.assignments[int(row)]
         item["target"] = target
         values = list(self.tree.item(row, "values"))
-        values[3] = core.display_rel(target) if target else UNCLASSIFIED
-        values[4] = "手动指定" if target else ""
+        values[4] = core.display_rel(target) if target else UNCLASSIFIED
+        values[5] = "手动指定" if target else ""
         self.tree.item(row, values=values)
         if target:
             self.tree.item(row, tags=())
@@ -450,8 +619,8 @@ class ChatSorterApp(tk.Tk):
             item = self.assignments[int(iid)]
             item["target"] = target
             values = list(self.tree.item(iid, "values"))
-            values[3] = core.display_rel(target) if target else UNCLASSIFIED
-            values[4] = "手动指定" if target else ""
+            values[4] = core.display_rel(target) if target else UNCLASSIFIED
+            values[5] = "手动指定" if target else ""
             self.tree.item(iid, values=values)
             if target:
                 self.tree.item(iid, tags=())
@@ -506,8 +675,9 @@ class ChatSorterApp(tk.Tk):
                 "dir": core.display_rel(item["target"]),
                 "reason": old_reason,
                 "confirmed": True,
+                "people": list(item["message"].people),
             }
-        core.save_cache(CACHE_PATH, self._cache)
+        self._save_cache_file()
 
     def _show_detail(self, _event) -> None:
         selected = self.tree.selection()
@@ -521,6 +691,7 @@ class ChatSorterApp(tk.Tk):
         win.geometry("820x560")
         header = (
             f"时间: {msg.time_str}\n发送者: {msg.sender_display} ({msg.sender_username})\n"
+            f"涉及人物: {'、'.join(msg.people) or '（未标注）'}\n"
             f"当前目标目录: {core.display_rel(item['target']) if item['target'] else UNCLASSIFIED}\n"
             f"LLM 理由: {reason}\n" + "-" * 60 + "\n\n"
         )

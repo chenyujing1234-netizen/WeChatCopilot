@@ -4,8 +4,10 @@
 1. 解析微信导出的 chat_txt 会话文件（如“文件传输助手.txt”）中的消息行。
 2. 扫描素材根目录（含根目录自身与递归子目录，跳过隐藏/技术目录），得到候选目录。
 3. 调用 LLM（OpenAI 兼容接口）判断每条消息归属哪个目录（只做推荐，不写盘）；
-   系统/附件消息（表情、文件传输记录等）自动跳过，不发给 LLM。
-4. 用户在界面确认后，按目录分组、按时间排序、整行去重后追加写入目标 txt。
+   系统/附件消息（表情、文件传输记录等）自动跳过，不发给 LLM；
+   用户标注的“涉及人物”会附在消息末尾一并发给 LLM 参考。
+4. 用户在界面确认后，按目录分组、按时间排序、整行去重后追加写入目标 txt；
+   有人物标注的消息写入时在行尾附加“（涉及人物：A、B）”。
 
 消息行格式（由 ContextBuddy 结构化导出生成）：
     [2026-07-22 20:16:11] 余井(wxid_jzemtwvdyvml21): 消息内容
@@ -47,11 +49,14 @@ _NOISE_MARKERS = ("<?xml", "@cdn_", "eyj", "<sysmsg", "<emoji", "<msgsource>")
 _LLM_CONTENT_LIMIT = 600
 # 候选目录送入 LLM 的最大条数
 _LLM_DIR_LIMIT = 1000
+# 写入行末尾的人物标注后缀（读取目标文件时用于还原原始行做去重）
+_PEOPLE_SUFFIX_RE = re.compile(r"（涉及人物：[^）]*）$")
 
 LLM_SYSTEM_PROMPT = """你是微信聊天记录归档助手。用户给你一个候选目录列表（相对路径）和一批编号的聊天消息。
 任务：为每条消息判断它最适合归档到哪个人的目录/哪个主题目录。
 规则：
 - 目录名多为人物（如家人、孩子、同事）或专辑主题；消息内容与某个人相关，就选对应人的目录。
+- 消息末尾可能带“（涉及人物：A、B）”，这是用户标注的该消息相关人物，判断目录时优先参考。
 - 只能从候选目录列表中选择，dir 字段必须与列表中的路径完全一致；没有合适目录时 dir 为空字符串。
 - reason 用不超过 20 个字说明判断理由。
 输出严格 JSON（不要 Markdown 代码块、不要多余文字）：
@@ -65,6 +70,7 @@ class ChatMessage:
     sender_username: str
     content: str
     line: str  # 原始消息行，写入目标文件时原样保留
+    people: list[str] = field(default_factory=list)  # 用户标注的涉及人物（参与 LLM 判断与写入）
 
 
 @dataclass
@@ -181,7 +187,10 @@ def build_llm_messages(candidates: list[CandidateDir], messages: list[ChatMessag
         content = msg.content
         if len(content) > _LLM_CONTENT_LIMIT:
             content = content[:_LLM_CONTENT_LIMIT] + "…"
-        lines.append(f"{idx}. [{msg.time_str}] {content}")
+        line = f"{idx}. [{msg.time_str}] {content}"
+        if msg.people:
+            line += f"（涉及人物：{'、'.join(msg.people)}）"
+        lines.append(line)
     return [
         {"role": "system", "content": LLM_SYSTEM_PROMPT},
         {"role": "user", "content": "\n".join(lines)},
@@ -231,7 +240,7 @@ def openai_chat_call(
 
 # ---------- 分类缓存（跨会话复用，同一消息不重复分析） ----------
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
 def message_key(msg: ChatMessage) -> str:
@@ -240,27 +249,73 @@ def message_key(msg: ChatMessage) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
-def load_cache(path: str | os.PathLike) -> dict:
-    """读取分类缓存 {key: {"dir","reason","confirmed"}}，缺失或损坏返回空 dict。"""
+def normalize_people(people) -> list[str]:
+    """人物列表规整：去空白、去重、保序。"""
+    out: list[str] = []
+    for p in people or []:
+        name = str(p).strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def load_cache_data(path: str | os.PathLike) -> dict:
+    """读取完整缓存 {"people","msg_people","entries"}；缺失或损坏返回空结构。
+
+    - people：用户在标注对话框里新增的列表外人物（跨会话保留）；
+    - msg_people：message_key -> 人物标注，重启后恢复每条消息的标注；
+    - entries：分类结果缓存（含 people，供判断标注变化后是否需要重新分析）。
+    """
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
-        return {}
-    entries = data.get("entries") if isinstance(data, dict) else None
-    return entries if isinstance(entries, dict) else {}
+        data = None
+    if not isinstance(data, dict):
+        data = {}
+    entries = data.get("entries")
+    raw_people = data.get("people")
+    msg_people = data.get("msg_people")
+    return {
+        "people": normalize_people(raw_people) if isinstance(raw_people, list) else [],
+        "msg_people": {
+            str(k): normalize_people(v) for k, v in msg_people.items()
+        } if isinstance(msg_people, dict) else {},
+        "entries": entries if isinstance(entries, dict) else {},
+    }
 
 
-def save_cache(path: str | os.PathLike, cache: dict) -> None:
-    """原子写入分类缓存（先写临时文件再整体替换）。"""
+def load_cache(path: str | os.PathLike) -> dict:
+    """读取缓存 entries（兼容旧调用方与 v1 旧文件）；损坏返回空 dict。"""
+    return load_cache_data(path)["entries"]
+
+
+def save_cache(
+    path: str | os.PathLike,
+    cache: dict,
+    *,
+    people: list | None = None,
+    msg_people: dict | None = None,
+) -> None:
+    """原子写入完整缓存（先写临时文件再整体替换）。"""
     tmp = f"{os.fspath(path)}.tmp"
+    data = {
+        "version": CACHE_VERSION,
+        "people": normalize_people(people),
+        "msg_people": {str(k): normalize_people(v) for k, v in (msg_people or {}).items()},
+        "entries": cache,
+    }
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"version": CACHE_VERSION, "entries": cache}, f, ensure_ascii=False, indent=1)
+        json.dump(data, f, ensure_ascii=False, indent=1)
     os.replace(tmp, path)
 
 
 def cache_lookup(cache: dict, msg: ChatMessage, cand_index: dict) -> ClassifyResult | None:
-    """命中缓存则返回对应分类结果（已确认的用确认目录），失效或未命中返回 None。"""
+    """命中缓存则返回对应分类结果（已确认的用确认目录），失效或未命中返回 None。
+
+    未确认的条目若人物标注与分析时不一致，视为失效重新分析（标注变了，
+    需要让 LLM 把新人物考虑进来）；已确认条目不受标注变化影响。
+    """
     entry = cache.get(message_key(msg))
     if not isinstance(entry, dict):
         return None
@@ -268,6 +323,8 @@ def cache_lookup(cache: dict, msg: ChatMessage, cand_index: dict) -> ClassifyRes
     cand = cand_index.get(dir_name) if dir_name else None
     if dir_name and cand is None:
         return None  # 上次推荐的目录已不存在，缓存失效需重新分析
+    if not entry.get("confirmed") and normalize_people(entry.get("people")) != normalize_people(msg.people):
+        return None  # 人物标注变了，缓存失效需重新分析
     reason = str(entry.get("reason") or "")
     if entry.get("confirmed"):
         reason = "上次已确认写入" + (f"：{reason}" if reason else "")
@@ -372,6 +429,7 @@ def classify_with_llm(
                             "dir": display_rel(res.candidate) if res.candidate else "",
                             "reason": res.reason,
                             "confirmed": False,
+                            "people": list(res.message.people),
                         }
             done += 1
             if parsed is None and not is_cancelled:
@@ -403,6 +461,11 @@ def sanitize_output_name(name: object) -> str:
     return cleaned or "微信聊天记录.txt"
 
 
+def people_suffix(msg: ChatMessage) -> str:
+    """消息写入目标文件时的人物标注后缀（未标注为空字符串）。"""
+    return f"（涉及人物：{'、'.join(msg.people)}）" if msg.people else ""
+
+
 def apply_writes(
     assignments: list[tuple[CandidateDir, ChatMessage]],
     *,
@@ -411,8 +474,9 @@ def apply_writes(
 ) -> list[WriteReport]:
     """把已确认的消息按目录分组写入目标 txt。
 
-    - 同一目录的消息按时间排序后追加；
-    - 目标文件中已存在的整行自动跳过（重复运行不会重复写入）；
+    - 同一目录的消息按时间排序后追加，行尾附人物标注“（涉及人物：A、B）”；
+    - 目标文件中已存在的整行自动跳过（带人物标注的旧行，其原始行同样视为已存在，
+      重复运行不会重复写入）；
     - 新建文件时先写入一行来源说明。
     """
     groups: dict[Path, list[ChatMessage]] = {}
@@ -432,7 +496,11 @@ def apply_writes(
             if file_exists:
                 with file_path.open("r", encoding="utf-8", errors="replace") as handle:
                     for ln in handle:
-                        existing.add(ln.rstrip("\r\n"))
+                        line = ln.rstrip("\r\n")
+                        existing.add(line)
+                        stem = _PEOPLE_SUFFIX_RE.sub("", line)
+                        if stem != line:
+                            existing.add(stem)  # 旧行带人物标注时，原始行也算已存在
             new_lines: list[str] = []
             if not file_exists:
                 new_lines.append(f"# 微信聊天记录（来源：{source_label}，按时间排序，重复自动跳过）")
@@ -440,8 +508,11 @@ def apply_writes(
                 if msg.line in existing:
                     skipped += 1
                     continue
+                out_line = msg.line + people_suffix(msg)
                 existing.add(msg.line)
-                new_lines.append(msg.line)
+                if out_line != msg.line:
+                    existing.add(out_line)
+                new_lines.append(out_line)
                 written += 1
             if new_lines:
                 with file_path.open("a", encoding="utf-8", newline="\n") as handle:
@@ -458,12 +529,15 @@ def summarize(results: list[ClassifyResult]) -> str:
     total = len(results)
     classified = sum(1 for r in results if r.candidate is not None)
     noise = sum(1 for r in results if is_noise_content(r.message.content))
+    annotated = sum(1 for r in results if r.message.people)
     failed = sum(1 for r in results if r.reason.startswith("LLM调用失败"))
     cancelled = sum(1 for r in results if r.reason == "已取消")
     text = (
         f"共 {total} 条消息：LLM 已推荐 {classified} 条，"
         f"未分类 {total - classified} 条（其中系统/附件 {noise} 条）"
     )
+    if annotated:
+        text += f"，已标注人物 {annotated} 条"
     if failed:
         text += f"，LLM 调用失败 {failed} 条（可重新分析或手动指定目录）"
     if cancelled:

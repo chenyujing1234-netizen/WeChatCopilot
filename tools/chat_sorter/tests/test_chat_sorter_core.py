@@ -334,3 +334,116 @@ def test_apply_writes_new_file_header(tmp_path: Path) -> None:
     lines = (person / "记录.txt").read_text(encoding="utf-8").splitlines()
     assert lines[0].startswith("# 微信聊天记录（来源：文件传输助手.txt")
     assert lines[1] == msg.line
+
+
+# ---------- 人物标注 ----------
+
+
+def test_chat_message_people_default() -> None:
+    msg = _msg("2026-07-22 20:16:11", "内容A")
+    assert msg.people == []
+    msg.people = ["喜乐", "老爸"]
+    assert msg.people == ["喜乐", "老爸"]
+
+
+def test_build_llm_messages_people(tmp_path: Path) -> None:
+    candidates = _make_candidates(tmp_path)
+    m1 = _msg("2026-07-23 19:24:07", "考得不错")
+    m1.people = ["喜乐", "老爸"]
+    m2 = _msg("2026-07-23 20:00:00", "随便聊聊")
+    user_text = core.build_llm_messages(candidates, [m1, m2])[1]["content"]
+    assert "（涉及人物：喜乐、老爸）" in user_text
+    assert user_text.count("（涉及人物：") == 1  # 未标注的消息不带后缀
+    assert "涉及人物" in core.LLM_SYSTEM_PROMPT  # 系统提示词有人物规则
+
+
+def test_cache_data_people_roundtrip(tmp_path: Path) -> None:
+    path = tmp_path / "classify_cache.json"
+    msg = _msg("2026-07-22 20:16:11", "内容A")
+    key = core.message_key(msg)
+    entries = {key: {"dir": "喜乐", "reason": "r", "confirmed": False, "people": ["喜乐"]}}
+    core.save_cache(path, entries, people=["张三"], msg_people={key: ["喜乐", "张三"]})
+    data = core.load_cache_data(path)
+    assert data["people"] == ["张三"]
+    assert data["msg_people"] == {key: ["喜乐", "张三"]}
+    assert data["entries"] == entries
+    assert core.load_cache(path) == entries  # 兼容旧调用方
+    # 损坏文件返回空结构
+    path.write_text("not json", encoding="utf-8")
+    assert core.load_cache_data(path) == {"people": [], "msg_people": {}, "entries": {}}
+
+
+def test_cache_lookup_people_mismatch(tmp_path: Path) -> None:
+    candidates = _make_candidates(tmp_path)
+    cand_index = {core.display_rel(c): c for c in candidates}
+    msg = _msg("2026-07-22 20:16:11", "内容A")
+    key = core.message_key(msg)
+    # 未确认条目：人物标注变了 -> 缓存失效，需重新分析
+    cache = {key: {"dir": "喜乐", "reason": "r", "confirmed": False, "people": ["喜乐"]}}
+    assert core.cache_lookup(cache, msg, cand_index) is None  # msg.people 为空
+    msg.people = ["喜乐"]
+    assert core.cache_lookup(cache, msg, cand_index) is not None  # 标注一致 -> 命中
+    # 已确认条目：标注变化不影响命中
+    cache[key]["confirmed"] = True
+    msg.people = ["老爸"]
+    hit = core.cache_lookup(cache, msg, cand_index)
+    assert hit is not None and "上次已确认写入" in hit.reason
+    # v1 旧条目（无 people 字段）与未标注消息兼容
+    cache[key] = {"dir": "喜乐", "reason": "r", "confirmed": False}
+    msg.people = []
+    assert core.cache_lookup(cache, msg, cand_index) is not None
+
+
+def test_classify_with_llm_cache_stores_people(tmp_path: Path) -> None:
+    candidates = _make_candidates(tmp_path)
+    msg = _msg("2026-07-22 20:16:11", "喜乐考得不错")
+    msg.people = ["喜乐"]
+    cache: dict = {}
+    results = core.classify_with_llm(
+        [msg], candidates,
+        call_llm=lambda m: '{"results":[{"index":1,"dir":"喜乐","reason":"提到喜乐"}]}',
+        cache=cache,
+    )
+    assert results[0].candidate is not None
+    entry = cache[core.message_key(msg)]
+    assert entry["people"] == ["喜乐"]  # 新结果记下分析时的人物标注
+
+
+def test_apply_writes_people_suffix(tmp_path: Path) -> None:
+    person = tmp_path / "喜乐"
+    person.mkdir()
+    target = person / "微信聊天记录.txt"
+    # 旧文件里已有：一条带人物标注的旧行 + 一条与待写入消息相同的原始行
+    annotated_old = "[2026-06-01 08:00:00] 余井(wxid_demo): 更早的一条（涉及人物：老妈）"
+    plain_old = "[2026-07-23 19:24:07] 余井(wxid_demo): 喜乐今天KET考试考得不错"
+    target.write_text(annotated_old + "\n" + plain_old + "\n", encoding="utf-8")
+    cand = core.CandidateDir(path=person, rel_display="喜乐", depth=1)
+
+    m1 = _msg("2026-07-23 19:24:07", "喜乐今天KET考试考得不错")  # 原始行已在文件中
+    m1.people = ["喜乐", "老爸"]
+    m2 = _msg("2026-06-01 08:00:00", "更早的一条")  # 旧行带标注，去标注后与本行相同
+    m3 = _msg("2026-08-01 09:00:00", "新消息")
+    m3.people = ["喜乐"]
+
+    reports = core.apply_writes(
+        [(cand, m) for m in (m1, m2, m3)],
+        output_filename="微信聊天记录.txt", source_label="文件传输助手.txt",
+    )
+    rep = reports[0]
+    assert rep.written == 1 and rep.skipped_existing == 2
+    lines = target.read_text(encoding="utf-8").splitlines()
+    assert lines[-1] == "[2026-08-01 09:00:00] 余井(wxid_demo): 新消息（涉及人物：喜乐）"
+    # 人物标注变化后重复写入同一消息，仍不会产生重复行
+    m1b = _msg("2026-07-23 19:24:07", "喜乐今天KET考试考得不错")
+    m1b.people = ["老爸"]
+    rep2 = core.apply_writes([(cand, m1b)], output_filename="微信聊天记录.txt", source_label="s")
+    assert rep2[0].written == 0 and rep2[0].skipped_existing == 1
+
+
+def test_summarize_annotated() -> None:
+    m1 = _msg("2026-07-23 19:24:07", "考得不错")
+    m1.people = ["喜乐"]
+    r1 = core.ClassifyResult(message=m1, reason="r")
+    r2 = core.ClassifyResult(message=_msg("2026-07-23 20:00:00", "x"), reason="")
+    text = core.summarize([r1, r2])
+    assert "已标注人物 1 条" in text
