@@ -81,6 +81,11 @@ class ChatSorterApp(tk.Tk):
         cfg = load_llm_config()
         # 人物消息导出目录：记住上一次的选择，导出时不再重复询问
         self._export_dir: str = str(cfg.get("export_dir", "") or "")
+        # 废弃关键词（内容包含即废弃）：默认用内置列表，用户可在界面修改
+        self.noise_markers: list[str] = [
+            str(m).strip() for m in cfg.get("noise_markers", []) if str(m).strip()
+        ] or list(core.DEFAULT_NOISE_MARKERS)
+        core.set_noise_markers(self.noise_markers)
 
         self._build_ui(cfg)
         self.after(100, self._poll_queue)
@@ -164,6 +169,9 @@ class ChatSorterApp(tk.Tk):
             assign, text="隐藏废弃项", variable=self.hide_discarded_var,
             command=self._apply_hide_discarded,
         ).pack(side="left", padx=(12, 0))
+        ttk.Button(assign, text="废弃关键词…", command=self._edit_noise_markers).pack(
+            side="left", padx=(12, 0)
+        )
 
         # 列表区：先建容器，Treeview 必须以容器为父级，
         # 否则列表会被排到主窗口底部，中间只剩一片空白
@@ -380,6 +388,52 @@ class ChatSorterApp(tk.Tk):
         except OSError:
             pass
 
+    def _edit_noise_markers(self) -> None:
+        """编辑“内容包含即废弃”的关键词（每行一个，保存后立即重新应用并持久化）。"""
+        if self._cancel_event is not None:
+            messagebox.showinfo("分析进行中", "请等本轮分析结束后再修改废弃关键词。")
+            return
+        win = tk.Toplevel(self)
+        win.title("废弃关键词")
+        win.geometry("560x380")
+        win.transient(self)
+        ttk.Label(
+            win, text="消息内容包含以下任一字符串即自动废弃（每行一个，大小写不敏感；空列表恢复默认）：",
+            padding=(10, 8),
+        ).pack(anchor="w")
+        text = scrolledtext.ScrolledText(win, wrap="none")
+        text.pack(fill="both", expand=True, padx=10)
+        text.insert("1.0", "\n".join(self.noise_markers))
+        text.focus_set()
+
+        def save() -> None:
+            markers = [
+                ln.strip() for ln in text.get("1.0", "end-1c").splitlines() if ln.strip()
+            ]
+            self.noise_markers = markers or list(core.DEFAULT_NOISE_MARKERS)
+            core.set_noise_markers(self.noise_markers)
+            cfg = load_llm_config()
+            cfg["noise_markers"] = self.noise_markers
+            save_llm_config(cfg)
+            win.destroy()
+            if self.assignments:
+                self._load_data()  # 重新应用废弃判定（缓存中的保留/手动标记不受影响）
+                self.status_var.set(
+                    f"废弃关键词已保存并重新加载（{len(self.noise_markers)} 个）。"
+                )
+            else:
+                self.status_var.set(f"废弃关键词已保存（{len(self.noise_markers)} 个）。")
+
+        def reset_default() -> None:
+            text.delete("1.0", "end")
+            text.insert("1.0", "\n".join(core.DEFAULT_NOISE_MARKERS))
+
+        row = ttk.Frame(win)
+        row.pack(fill="x", pady=6)
+        ttk.Button(row, text="保 存", command=save).pack(side="left", padx=4)
+        ttk.Button(row, text="恢复默认", command=reset_default).pack(side="left", padx=4)
+        ttk.Button(row, text="取 消", command=win.destroy).pack(side="left", padx=4)
+
     def _set_row_discard(self, idx: int, iid: str, discarded: bool) -> None:
         """标记/取消一行废弃：手动标记优先于系统/附件自动判定，并立即持久化。
 
@@ -464,6 +518,7 @@ class ChatSorterApp(tk.Tk):
             "recent_days": recent_days,
             "export_dir": self._export_dir,
             "output_name": self.out_var.get().strip(),
+            "noise_markers": self.noise_markers,
         }
         save_llm_config(cfg)
         self._cancel_event = threading.Event()

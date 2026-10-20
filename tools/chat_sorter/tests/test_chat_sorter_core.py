@@ -214,6 +214,20 @@ def test_is_noise_content() -> None:
     assert not core.is_noise_content("复制这个文档给喜乐看看，然后打开抖音说过的教程")
 
 
+def test_set_noise_markers() -> None:
+    try:
+        core.set_noise_markers(["拼多多", "  ", "砍一刀"])
+        assert core.is_noise_content("帮我看下这个拼多多链接")
+        assert core.is_noise_content("来砍一刀呗")
+        assert not core.is_noise_content('<?xml version="1.0"?>')  # 自定义完全替代默认
+        assert not core.is_noise_content("时代不一样了，两种方式各有缘由。")
+        # 大小写不敏感
+        core.set_noise_markers(["Open"])
+        assert core.is_noise_content("please OPEN the door")
+    finally:
+        core.set_noise_markers(core.DEFAULT_NOISE_MARKERS)
+
+
 def test_ensure_self() -> None:
     # 涉及人员固定包含“我”，放最前
     assert core.ensure_self(["张三", "李四"]) == ["我", "张三", "李四"]

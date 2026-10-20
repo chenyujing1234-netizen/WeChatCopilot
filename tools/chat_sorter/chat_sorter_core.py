@@ -44,9 +44,27 @@ _EXCLUDED_DIR_NAMES = {
 
 # 消息内容含这些标记时视为系统/附件消息，不发送给 LLM（仍可手动指定目录）
 # “复制打开抖音”是抖音分享文案的固定字眼，这类推广消息自动废弃
-_NOISE_MARKERS = (
+DEFAULT_NOISE_MARKERS = (
     "<?xml", "@cdn_", "eyj", "<sysmsg", "<emoji", "<msgsource", "复制打开抖音",
 )
+# 当前生效的废弃关键词（界面里可编辑，通过 set_noise_markers 更新）
+_noise_markers: tuple[str, ...] = DEFAULT_NOISE_MARKERS
+
+
+def set_noise_markers(markers) -> None:
+    """设置“内容包含即废弃”的关键词列表，完全替代默认列表（空白项自动忽略）。"""
+    global _noise_markers
+    _noise_markers = tuple(
+        m.strip() for m in markers if isinstance(m, str) and m.strip()
+    )
+
+
+def is_noise_content(content: str) -> bool:
+    """系统/附件消息（表情、文件传输记录、链接 XML、命中废弃关键词的文案）不发给 LLM。"""
+    if not content.strip():
+        return True
+    low = content.lower()
+    return any(marker.lower() in low for marker in _noise_markers)
 
 # 单条消息送入 LLM 的最大字符数
 _LLM_CONTENT_LIMIT = 600
@@ -119,14 +137,6 @@ def parse_chat_txt(file_path: str | os.PathLike) -> list[ChatMessage]:
             )
         )
     return messages
-
-
-def is_noise_content(content: str) -> bool:
-    """系统/附件消息（表情、文件传输记录、链接 XML 等）不发送给 LLM。"""
-    if not content.strip():
-        return True
-    low = content.lower()
-    return any(marker in low for marker in _NOISE_MARKERS)
 
 
 # 涉及人员中固定包含的“我”（微信本人，文件传输助手消息都涉及自己）
