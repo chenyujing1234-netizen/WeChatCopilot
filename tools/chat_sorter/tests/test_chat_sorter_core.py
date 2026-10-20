@@ -201,6 +201,19 @@ def test_message_key_stable() -> None:
     assert core.message_key(a) != core.message_key(d)
 
 
+def test_is_noise_content() -> None:
+    # 常规系统/附件标记
+    assert core.is_noise_content('<?xml version="1.0"?><msg><title>标题</title></msg>')
+    assert core.is_noise_content("2.txt 6 0 0 0 8283 @cdn_305f02 abc 0 0")
+    assert core.is_noise_content("")  # 空内容
+    # 抖音分享文案：自动废弃
+    assert core.is_noise_content("喜乐的直播，复制打开抖音，看看【喜乐的作品】")
+    assert core.is_noise_content("复制打开抖音搜索更多精彩内容")
+    # 正常消息不废弃
+    assert not core.is_noise_content("时代不一样了，两种方式各有缘由。")
+    assert not core.is_noise_content("复制这个文档给喜乐看看，然后打开抖音说过的教程")
+
+
 def test_ensure_self() -> None:
     # 涉及人员固定包含“我”，放最前
     assert core.ensure_self(["张三", "李四"]) == ["我", "张三", "李四"]

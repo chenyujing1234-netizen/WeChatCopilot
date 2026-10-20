@@ -43,7 +43,10 @@ _EXCLUDED_DIR_NAMES = {
 }
 
 # 消息内容含这些标记时视为系统/附件消息，不发送给 LLM（仍可手动指定目录）
-_NOISE_MARKERS = ("<?xml", "@cdn_", "eyj", "<sysmsg", "<emoji", "<msgsource>")
+# “复制打开抖音”是抖音分享文案的固定字眼，这类推广消息自动废弃
+_NOISE_MARKERS = (
+    "<?xml", "@cdn_", "eyj", "<sysmsg", "<emoji", "<msgsource", "复制打开抖音",
+)
 
 # 单条消息送入 LLM 的最大字符数
 _LLM_CONTENT_LIMIT = 600
