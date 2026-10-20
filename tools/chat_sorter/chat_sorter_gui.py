@@ -78,6 +78,8 @@ class ChatSorterApp(tk.Tk):
         self._loaded_sig: tuple | None = None  # 已加载数据的 (源文件, 根目录, 深度)
         self._dir_editor: ttk.Combobox | None = None  # 行内目录编辑器（双击“推荐目录”列出现）
         cfg = load_llm_config()
+        # 人物消息导出目录：记住上一次的选择，导出时不再重复询问
+        self._export_dir: str = str(cfg.get("export_dir", "") or "")
 
         self._build_ui(cfg)
         self.after(100, self._poll_queue)
@@ -199,8 +201,14 @@ class ChatSorterApp(tk.Tk):
             bottom, text="导出人物消息", command=self._export_people_messages, state="disabled"
         )
         self.export_people_btn.pack(side="left", padx=(10, 0))
+        self.change_export_dir_btn = ttk.Button(
+            bottom, text="更换导出目录", command=self._choose_export_dir
+        )
+        self.change_export_dir_btn.pack(side="left", padx=(6, 0))
         ttk.Label(
-            bottom, text="“确认写入”后才会把消息真正追加到各目录的 txt 文件中（已存在的行自动跳过）。"
+            bottom,
+            text="“确认写入”把消息追加到各自目标目录的 txt（已存在的行自动跳过）；"
+                 "“导出人物消息”把所有有人物标注的行合并成一个 txt 存入导出目录。",
         ).pack(side="left", padx=10)
 
         self.result_text = scrolledtext.ScrolledText(self, height=9, wrap="word", state="disabled")
@@ -449,6 +457,7 @@ class ChatSorterApp(tk.Tk):
             "batch_size": max(5, min(50, int(self.batch_var.get() or 20))),
             "max_depth": depth,
             "recent_days": recent_days,
+            "export_dir": self._export_dir,
             "output_name": self.out_var.get().strip(),
         }
         save_llm_config(cfg)
@@ -792,10 +801,26 @@ class ChatSorterApp(tk.Tk):
         count = sum(1 for item in self.assignments if item["target"])
         self.confirm_btn.configure(text=f"确认写入（{count} 条）")
 
+    def _choose_export_dir(self) -> None:
+        """手动更换人物消息导出目录（会被记住，导出时不再重复询问）。"""
+        directory = filedialog.askdirectory(
+            title="选择人物消息的保存目录", initialdir=self._export_dir or None
+        )
+        if directory:
+            self._save_export_dir(directory)
+            self.status_var.set(f"导出目录已切换为 {directory}。")
+
+    def _save_export_dir(self, directory: str) -> None:
+        """记住导出目录：合并写回 llm_config.json，不影响其他配置。"""
+        self._export_dir = directory
+        cfg = load_llm_config()
+        cfg["export_dir"] = directory
+        save_llm_config(cfg)
+
     def _export_people_messages(self) -> None:
         """把所有标注了“涉及人物”的消息（废弃行除外）合并导出到一个 txt。
 
-        保存目录由用户选择，文件固定为“涉及人员消息.txt”；
+        保存目录记住上次的选择（可用“更换导出目录”按钮调整），文件固定为“涉及人员消息.txt”；
         格式：每条消息上方一行“==== 涉及人员：A、B ====”，下面是原始消息行。
         """
         rows = [
@@ -806,9 +831,13 @@ class ChatSorterApp(tk.Tk):
         if not rows:
             messagebox.showinfo("无可导出数据", "当前没有标注“涉及人物”的消息行。")
             return
-        directory = filedialog.askdirectory(title="选择人物消息的保存目录")
-        if not directory:
-            return  # 用户取消
+        # 用上次导出目录直接保存（目录不存在时才重新选），选择结果会记住
+        directory = self._export_dir
+        if not directory or not Path(directory).is_dir():
+            directory = filedialog.askdirectory(title="选择人物消息的保存目录")
+            if not directory:
+                return  # 用户取消
+            self._save_export_dir(directory)
         path = Path(directory) / "涉及人员消息.txt"
         if path.exists() and not messagebox.askyesno(
             "覆盖确认", f"{path} 已存在，覆盖写入吗？"
