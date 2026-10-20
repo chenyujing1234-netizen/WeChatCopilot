@@ -269,11 +269,12 @@ def normalize_people(people) -> list[str]:
 
 
 def load_cache_data(path: str | os.PathLike) -> dict:
-    """读取完整缓存 {"people","msg_people","msg_discarded","entries"}；缺失或损坏返回空结构。
+    """读取完整缓存 {"people","msg_people","msg_discarded","msg_exported","entries"}；缺失或损坏返回空结构。
 
     - people：用户在标注对话框里新增的列表外人物（跨会话保留）；
     - msg_people：message_key -> 人物标注，重启后恢复每条消息的标注；
     - msg_discarded：message_key -> 废弃标记（True=手动废弃，False=保留系统/附件行）；
+    - msg_exported：message_key -> 已导出日期（人物消息导出去重，避免重复保存）；
     - entries：分类结果缓存（含 people，供判断标注变化后是否需要重新分析）。
     """
     try:
@@ -287,6 +288,7 @@ def load_cache_data(path: str | os.PathLike) -> dict:
     raw_people = data.get("people")
     msg_people = data.get("msg_people")
     msg_discarded = data.get("msg_discarded")
+    msg_exported = data.get("msg_exported")
     return {
         "people": normalize_people(raw_people) if isinstance(raw_people, list) else [],
         "msg_people": {
@@ -295,6 +297,9 @@ def load_cache_data(path: str | os.PathLike) -> dict:
         "msg_discarded": {
             str(k): bool(v) for k, v in msg_discarded.items()
         } if isinstance(msg_discarded, dict) else {},
+        "msg_exported": {
+            str(k): str(v) for k, v in msg_exported.items()
+        } if isinstance(msg_exported, dict) else {},
         "entries": entries if isinstance(entries, dict) else {},
     }
 
@@ -311,6 +316,7 @@ def save_cache(
     people: list | None = None,
     msg_people: dict | None = None,
     msg_discarded: dict | None = None,
+    msg_exported: dict | None = None,
 ) -> None:
     """原子写入完整缓存（先写临时文件再整体替换）。"""
     tmp = f"{os.fspath(path)}.tmp"
@@ -319,6 +325,7 @@ def save_cache(
         "people": normalize_people(people),
         "msg_people": {str(k): normalize_people(v) for k, v in (msg_people or {}).items()},
         "msg_discarded": {str(k): bool(v) for k, v in (msg_discarded or {}).items()},
+        "msg_exported": {str(k): str(v) for k, v in (msg_exported or {}).items()},
         "entries": cache,
     }
     with open(tmp, "w", encoding="utf-8") as f:

@@ -75,6 +75,7 @@ class ChatSorterApp(tk.Tk):
         self._custom_people: list[str] = []  # 用户新增的列表外人物（持久化在缓存文件）
         self._msg_people: dict[str, list[str]] = {}  # message_key -> 人物标注（持久化，重启后恢复）
         self._msg_discarded: dict[str, bool] = {}  # message_key -> 废弃标记（持久化；False=保留系统/附件行）
+        self._msg_exported: dict[str, str] = {}  # message_key -> 已导出日期（持久化，导出时去重）
         self._loaded_sig: tuple | None = None  # 已加载数据的 (源文件, 根目录, 深度)
         self._dir_editor: ttk.Combobox | None = None  # 行内目录编辑器（双击“推荐目录”列出现）
         cfg = load_llm_config()
@@ -275,6 +276,7 @@ class ChatSorterApp(tk.Tk):
         self._custom_people = cache_data["people"]
         self._msg_people = cache_data["msg_people"]
         self._msg_discarded = cache_data["msg_discarded"]
+        self._msg_exported = cache_data["msg_exported"]
         for m in messages:  # 恢复上次标注的人物
             key = core.message_key(m)
             if key in self._msg_people:
@@ -365,12 +367,12 @@ class ChatSorterApp(tk.Tk):
         return cached_hits
 
     def _save_cache_file(self) -> None:
-        """把分类缓存、人物名单、人物标注与废弃标记整体落盘（失败不打断界面）。"""
+        """把分类缓存、人物名单、人物标注、废弃标记与导出去重标记整体落盘（失败不打断界面）。"""
         try:
             core.save_cache(
                 CACHE_PATH, self._cache,
                 people=self._custom_people, msg_people=self._msg_people,
-                msg_discarded=self._msg_discarded,
+                msg_discarded=self._msg_discarded, msg_exported=self._msg_exported,
             )
         except OSError:
             pass
@@ -818,18 +820,27 @@ class ChatSorterApp(tk.Tk):
         save_llm_config(cfg)
 
     def _export_people_messages(self) -> None:
-        """把所有标注了“涉及人物”的消息（废弃行除外）合并导出到一个 txt。
+        """把所有标注了“涉及人物”的消息（废弃行除外）合并导出到按日期命名的 txt。
 
-        保存目录记住上次的选择（可用“更换导出目录”按钮调整），文件固定为“涉及人员消息.txt”；
-        格式：每条消息上方一行“==== 涉及人员：A、B ====”，下面是原始消息行。
+        上次已导出过的消息自动跳过并提示不用再保存；文件名含导出日期，
+        同一天重复导出时向同一文件追加；保存目录记住上次的选择。
         """
-        rows = [
+        annotated = [
             item for item in self.assignments
             if not item["discarded"]
             and self._msg_people.get(core.message_key(item["message"]))
         ]
-        if not rows:
+        if not annotated:
             messagebox.showinfo("无可导出数据", "当前没有标注“涉及人物”的消息行。")
+            return
+        rows = [
+            item for item in annotated
+            if core.message_key(item["message"]) not in self._msg_exported
+        ]
+        if not rows:
+            messagebox.showinfo(
+                "无需再次保存", "所有有人物标注的消息上次已导出过，不用再保存了。"
+            )
             return
         # 用上次导出目录直接保存（目录不存在时才重新选），选择结果会记住
         directory = self._export_dir
@@ -838,28 +849,34 @@ class ChatSorterApp(tk.Tk):
             if not directory:
                 return  # 用户取消
             self._save_export_dir(directory)
-        path = Path(directory) / "涉及人员消息.txt"
-        if path.exists() and not messagebox.askyesno(
-            "覆盖确认", f"{path} 已存在，覆盖写入吗？"
-        ):
-            return
+        today = date.today().isoformat()
+        path = Path(directory) / f"涉及人员消息_{today}.txt"
         blocks = []
         for item in rows:
             msg = item["message"]
-            people = "、".join(self._msg_people[core.message_key(msg)])
+            key = core.message_key(msg)
+            people = "、".join(self._msg_people[key])
             blocks.append(f"==== 涉及人员：{people} ====\n{msg.line}")
+            self._msg_exported[key] = today  # 标记已导出，下次不再重复保存
         try:
-            path.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+            exists = path.exists()
+            with open(path, "a", encoding="utf-8") as f:
+                if exists:
+                    f.write("\n")  # 与之前的导出内容隔一个空行
+                f.write("\n\n".join(blocks) + "\n")
         except OSError as exc:
             messagebox.showerror("导出失败", str(exc))
             return
-        skipped = sum(
+        self._save_cache_file()
+        skipped_exported = len(annotated) - len(rows)
+        skipped_discard = sum(
             1 for item in self.assignments
             if item["discarded"] and self._msg_people.get(core.message_key(item["message"]))
         )
         self.status_var.set(
             f"已导出 {len(rows)} 条人物消息到 {path}"
-            + (f"（{skipped} 条废弃行未导出）" if skipped else "")
+            + (f"（{skipped_exported} 条上次已导出过，未重复保存）" if skipped_exported else "")
+            + (f"（{skipped_discard} 条废弃行未导出）" if skipped_discard else "")
         )
 
     def _confirm_write(self) -> None:

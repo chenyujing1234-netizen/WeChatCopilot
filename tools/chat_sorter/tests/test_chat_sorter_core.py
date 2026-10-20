@@ -381,7 +381,7 @@ def test_cache_data_people_roundtrip(tmp_path: Path) -> None:
     # 损坏文件返回空结构
     path.write_text("not json", encoding="utf-8")
     assert core.load_cache_data(path) == {
-        "people": [], "msg_people": {}, "msg_discarded": {}, "entries": {}
+        "people": [], "msg_people": {}, "msg_discarded": {}, "msg_exported": {}, "entries": {}
     }
 
 
@@ -396,6 +396,19 @@ def test_cache_data_discarded_roundtrip(tmp_path: Path) -> None:
     # 旧缓存文件（无 msg_discarded 字段）：返回空 dict，不报错
     path.write_text(json.dumps({"version": 2, "entries": {}}), encoding="utf-8")
     assert core.load_cache_data(path)["msg_discarded"] == {}
+
+
+def test_cache_data_exported_roundtrip(tmp_path: Path) -> None:
+    path = tmp_path / "classify_cache.json"
+    msg = _msg("2026-07-22 20:16:11", "内容A")
+    key = core.message_key(msg)
+    core.save_cache(path, {}, msg_exported={key: "2026-10-20", "k2": "2026-10-19"})
+    data = core.load_cache_data(path)
+    # 已导出日期原样往返（message_key -> 导出日期字符串）
+    assert data["msg_exported"] == {key: "2026-10-20", "k2": "2026-10-19"}
+    # 旧缓存文件（无 msg_exported 字段）：返回空 dict，不报错
+    path.write_text(json.dumps({"version": 2, "entries": {}}), encoding="utf-8")
+    assert core.load_cache_data(path)["msg_exported"] == {}
 
 
 def test_cache_lookup_people_mismatch(tmp_path: Path) -> None:
