@@ -655,49 +655,90 @@ class ChatSorterApp(tk.Tk):
         return [core.SELF_PERSON] + sorted(names)
 
     def _build_people_selector(self, parent, msg) -> tuple:
-        """在 parent 内创建人物多选控件（候选列表 + 新增输入行），返回 (selected_names, refill)。
+        """在 parent 内创建人物选择控件（已选标签 + 输入联想），返回 (selected_names, refill)。
 
-        selected_names() 返回当前勾选的人物集合；refill(select) 以新勾选集合重建
-        列表（新增人物后调用，保证新名字出现在列表中并处于勾选状态）。
+        已选人物显示为可点击删除的标签（“我”固定不可删）；在输入框打字即时
+        联想候选（排除已选），回车或双击联想项加入；输入全新名字回车即新增人物。
+        selected_names() 返回当前已选人物集合；refill(select) 以新集合重建标签。
         """
-        list_frame = ttk.Frame(parent)
-        list_frame.pack(fill="x")
-        listbox = tk.Listbox(list_frame, selectmode="multiple", exportselection=False, height=5)
-        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
-        listbox.configure(yscrollcommand=scroll.set)
-        listbox.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
+        selected: set[str] = set(msg.people)
 
-        def selected_names() -> set[str]:
-            return {listbox.get(i) for i in listbox.curselection()}
+        chips_frame = ttk.Frame(parent)
+        chips_frame.pack(fill="x")
+        ttk.Label(
+            parent, text="输入即联想，回车加入；点标签 ✕ 删除；全新名字回车即新增"
+        ).pack(anchor="w", pady=(4, 1))
+        entry = ttk.Entry(parent)
+        entry.pack(fill="x")
+        sugg = tk.Listbox(parent, height=4, exportselection=False)
 
-        def refill(select: set[str]) -> None:
-            listbox.delete(0, "end")
-            for name in self._people_choices(sorted(select)):
-                listbox.insert("end", name)
-                if name in select:
-                    listbox.selection_set("end")
+        def hide_sugg() -> None:
+            sugg.pack_forget()
 
-        refill(set(msg.people))
+        def update_sugg(*_args) -> None:
+            text = entry.get().strip().lower()
+            sugg.delete(0, "end")
+            if text:
+                for name in self._people_choices():
+                    if name not in selected and text in name.lower():
+                        sugg.insert("end", name)
+            if sugg.size():
+                sugg.pack(fill="x", pady=(2, 0))
+                sugg.selection_clear(0, "end")
+                sugg.activate(0)
+            else:
+                hide_sugg()
 
-        add_row = ttk.Frame(parent)
-        add_row.pack(fill="x", pady=(4, 0))
-        new_var = tk.StringVar()
-        entry = ttk.Entry(add_row, textvariable=new_var)
-        entry.pack(side="left", fill="x", expand=True)
+        def rebuild_chips() -> None:
+            for child in chips_frame.winfo_children():
+                child.destroy()
+            for i, name in enumerate(core.ensure_self(sorted(selected))):
+                row, col = divmod(i, 5)  # 每行最多 5 个标签，超出自动换行
+                if name == core.SELF_PERSON:
+                    ttk.Label(chips_frame, text="我", padding=(4, 2)).grid(
+                        row=row, column=col, sticky="w", padx=(0, 10), pady=2
+                    )
+                    continue
+                ttk.Button(
+                    chips_frame, text=f"{name} ✕",
+                    command=lambda n=name: (selected.discard(n), rebuild_chips()),
+                ).grid(row=row, column=col, sticky="w", padx=(0, 10), pady=2)
 
-        def add_person() -> None:
-            name = new_var.get().strip()
+        def add_name(name: str) -> None:
+            name = name.strip()
             if not name:
                 return
-            if name not in self._custom_people:
+            if name not in self._custom_people and name != core.SELF_PERSON:
                 self._custom_people.append(name)  # 列表外人物持久保存，下次仍在
                 self._save_cache_file()
+            selected.add(name)
             entry.delete(0, "end")
-            refill(selected_names() | {name})
+            hide_sugg()
+            rebuild_chips()
             entry.focus_set()
 
-        ttk.Button(add_row, text="新增并勾选", command=add_person).pack(side="left", padx=(6, 0))
+        def on_return(_event) -> str:
+            if sugg.winfo_ismapped() and sugg.size():
+                add_name(sugg.get("active"))  # 有联想：加入当前高亮项
+            else:
+                add_name(entry.get())  # 无联想：把输入当作新人物新增
+            return "break"
+
+        entry.bind("<KeyRelease>", update_sugg)
+        entry.bind("<Return>", on_return)
+        sugg.bind("<Double-1>", lambda _e: add_name(sugg.get("active")))
+        sugg.bind("<Return>", lambda _e: add_name(sugg.get("active")))
+
+        def selected_names() -> set[str]:
+            return set(selected)
+
+        def refill(select: set[str]) -> None:
+            selected.clear()
+            selected.update(core.ensure_self(sorted(select)))
+            rebuild_chips()
+
+        rebuild_chips()
+        entry.focus_set()
         return selected_names, refill
 
     def _commit_people(self, row: str, people: list[str]) -> None:
@@ -956,8 +997,8 @@ class ChatSorterApp(tk.Tk):
         )
         ttk.Label(win, text=info, justify="left", padding=(12, 10, 12, 4)).pack(anchor="w")
 
-        # 涉及人物：列表多选 + 新增，保存后写回消息、缓存与表格行
-        people_frame = ttk.LabelFrame(win, text="涉及人物（勾选，可新增列表外人物）", padding=(8, 6))
+        # 涉及人物：已选标签 + 输入联想，保存后写回消息、缓存与表格行
+        people_frame = ttk.LabelFrame(win, text="涉及人物（输入框联想选择，点标签删除）", padding=(8, 6))
         people_frame.pack(fill="x", padx=12)
         selected_names, _refill = self._build_people_selector(people_frame, msg)
 
