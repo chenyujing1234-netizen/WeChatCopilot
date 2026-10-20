@@ -655,18 +655,18 @@ class ChatSorterApp(tk.Tk):
         return [core.SELF_PERSON] + sorted(names)
 
     def _build_people_selector(self, parent, msg) -> tuple:
-        """在 parent 内创建人物选择控件（已选标签 + 输入联想），返回 (selected_names, refill)。
+        """在 parent 内创建人物选择控件（全量点选 + 输入联想），返回 (selected_names, refill)。
 
-        已选人物显示为可点击删除的标签（“我”固定不可删）；在输入框打字即时
-        联想候选（排除已选），回车或双击联想项加入；输入全新名字回车即新增人物。
-        selected_names() 返回当前已选人物集合；refill(select) 以新集合重建标签。
+        所有可选人物平铺为按钮，点击切换选中（“✓”前缀表示已选；“我”固定选中）；
+        输入框打字即时联想，回车或双击加入；输入全新名字回车即新增人物。
+        selected_names() 返回当前已选人物集合；refill(select) 以新集合重建面板。
         """
         selected: set[str] = set(msg.people)
 
-        chips_frame = ttk.Frame(parent)
-        chips_frame.pack(fill="x")
+        palette_frame = ttk.Frame(parent)
+        palette_frame.pack(fill="x")
         ttk.Label(
-            parent, text="输入即联想，回车加入；点标签 ✕ 删除；全新名字回车即新增"
+            parent, text="点击人物名切换选中（✓ 为已选）；输入框联想回车加入；全新名字回车即新增"
         ).pack(anchor="w", pady=(4, 1))
         entry = ttk.Entry(parent)
         entry.pack(fill="x")
@@ -689,20 +689,28 @@ class ChatSorterApp(tk.Tk):
             else:
                 hide_sugg()
 
-        def rebuild_chips() -> None:
-            for child in chips_frame.winfo_children():
+        def rebuild_palette() -> None:
+            for child in palette_frame.winfo_children():
                 child.destroy()
-            for i, name in enumerate(core.ensure_self(sorted(selected))):
-                row, col = divmod(i, 5)  # 每行最多 5 个标签，超出自动换行
-                if name == core.SELF_PERSON:
-                    ttk.Label(chips_frame, text="我", padding=(4, 2)).grid(
-                        row=row, column=col, sticky="w", padx=(0, 10), pady=2
-                    )
-                    continue
+            names = [core.SELF_PERSON] + sorted(
+                (set(self._people_choices()) | selected) - {core.SELF_PERSON}
+            )
+            for i, name in enumerate(names):
+                row, col = divmod(i, 5)  # 每行最多 5 个，超出自动换行
+                mark = "✓ " if name in selected else ""
                 ttk.Button(
-                    chips_frame, text=f"{name} ✕",
-                    command=lambda n=name: (selected.discard(n), rebuild_chips()),
+                    palette_frame, text=f"{mark}{name}",
+                    command=lambda n=name: toggle(n),
                 ).grid(row=row, column=col, sticky="w", padx=(0, 10), pady=2)
+
+        def toggle(name: str) -> None:
+            if name == core.SELF_PERSON:
+                return  # “我”固定选中，不可取消
+            if name in selected:
+                selected.discard(name)
+            else:
+                selected.add(name)
+            rebuild_palette()
 
         def add_name(name: str) -> None:
             name = name.strip()
@@ -714,7 +722,7 @@ class ChatSorterApp(tk.Tk):
             selected.add(name)
             entry.delete(0, "end")
             hide_sugg()
-            rebuild_chips()
+            rebuild_palette()
             entry.focus_set()
 
         def on_return(_event) -> str:
@@ -735,9 +743,9 @@ class ChatSorterApp(tk.Tk):
         def refill(select: set[str]) -> None:
             selected.clear()
             selected.update(core.ensure_self(sorted(select)))
-            rebuild_chips()
+            rebuild_palette()
 
-        rebuild_chips()
+        rebuild_palette()
         entry.focus_set()
         return selected_names, refill
 
@@ -997,8 +1005,8 @@ class ChatSorterApp(tk.Tk):
         )
         ttk.Label(win, text=info, justify="left", padding=(12, 10, 12, 4)).pack(anchor="w")
 
-        # 涉及人物：已选标签 + 输入联想，保存后写回消息、缓存与表格行
-        people_frame = ttk.LabelFrame(win, text="涉及人物（输入框联想选择，点标签删除）", padding=(8, 6))
+        # 涉及人物：全量平铺点选 + 输入联想，保存后写回消息、缓存与表格行
+        people_frame = ttk.LabelFrame(win, text="涉及人物（点击切换选中，✓ 为已选）", padding=(8, 6))
         people_frame.pack(fill="x", padx=12)
         selected_names, _refill = self._build_people_selector(people_frame, msg)
 
