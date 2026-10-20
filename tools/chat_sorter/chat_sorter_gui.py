@@ -220,6 +220,12 @@ class ChatSorterApp(tk.Tk):
                  "“导出人物消息”把所有有人物标注的行合并成一个 txt 存入导出目录。",
         ).pack(side="left", padx=10)
 
+        # 导出结果提示：显示在“导出人物消息”按钮行的正下方
+        self.export_status_var = tk.StringVar(value="")
+        ttk.Label(
+            self, textvariable=self.export_status_var, padding=(12, 0), foreground="#2a6f2a"
+        ).pack(fill="x")
+
         self.result_text = scrolledtext.ScrolledText(self, height=9, wrap="word", state="disabled")
         self.result_text.pack(fill="both", padx=10, pady=(4, 10))
 
@@ -959,8 +965,8 @@ class ChatSorterApp(tk.Tk):
             if core.message_key(item["message"]) not in self._msg_exported
         ]
         if not rows:
-            messagebox.showinfo(
-                "无需再次保存", "所有有人物标注的消息上次已导出过，不用再保存了。"
+            self.export_status_var.set(
+                f"所有 {len(annotated)} 条有人物标注的消息上次已导出过，不用再保存了。"
             )
             return
         # 用上次导出目录直接保存（目录不存在时才重新选），选择结果会记住
@@ -994,7 +1000,7 @@ class ChatSorterApp(tk.Tk):
             1 for item in self.assignments
             if item["discarded"] and self._msg_people.get(core.message_key(item["message"]))
         )
-        self.status_var.set(
+        self.export_status_var.set(
             f"已导出 {len(rows)} 条人物消息到 {path}"
             + (f"（{skipped_exported} 条上次已导出过，未重复保存）" if skipped_exported else "")
             + (f"（{skipped_discard} 条废弃行未导出）" if skipped_discard else "")
