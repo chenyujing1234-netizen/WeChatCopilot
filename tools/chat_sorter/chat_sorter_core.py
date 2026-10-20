@@ -126,6 +126,18 @@ def is_noise_content(content: str) -> bool:
     return any(marker in low for marker in _NOISE_MARKERS)
 
 
+# 涉及人员中固定包含的“我”（微信本人，文件传输助手消息都涉及自己）
+SELF_PERSON = "我"
+
+
+def ensure_self(people: list[str]) -> list[str]:
+    """涉及人员固定包含“我”（放最前，去重保序）；空标注保持为空（视为未标注）。"""
+    names = normalize_people(people)
+    if not names:
+        return []
+    return [SELF_PERSON] + [p for p in names if p != SELF_PERSON]
+
+
 # 汉字（CJK 统一表意文字基本区，不含中文标点）
 _CHINESE_RE = re.compile(r"[\u4e00-\u9fff]")
 

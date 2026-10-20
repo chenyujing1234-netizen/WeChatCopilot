@@ -275,6 +275,9 @@ class ChatSorterApp(tk.Tk):
         self._cache = cache_data["entries"]
         self._custom_people = cache_data["people"]
         self._msg_people = cache_data["msg_people"]
+        # 涉及人员固定包含“我”：历史标注一并补上（空标注保持为空）
+        for key, people in self._msg_people.items():
+            self._msg_people[key] = core.ensure_self(people)
         self._msg_discarded = cache_data["msg_discarded"]
         self._msg_exported = cache_data["msg_exported"]
         for m in messages:  # 恢复上次标注的人物
@@ -639,14 +642,17 @@ class ChatSorterApp(tk.Tk):
         self._refresh_confirm_label()
 
     def _people_choices(self, extra: list[str] | None = None) -> list[str]:
-        """人物候选名单：顶层候选目录名 + 用户新增人物 + 所有已标注过的人物。"""
-        names = {c.rel_display for c in self.candidates if c.depth == 1}
-        names.update(self._custom_people)
+        """人物候选名单：用户新增人物 + 所有已标注过的人物，固定包含“我”。
+
+        不再从目录列表的文件夹名取人物，只认用户输入/选择过的名字。
+        """
+        names = set(self._custom_people)
         for people in self._msg_people.values():
             names.update(people)
         if extra:
             names.update(extra)
-        return sorted(names)
+        names.discard(core.SELF_PERSON)
+        return [core.SELF_PERSON] + sorted(names)
 
     def _build_people_selector(self, parent, msg) -> tuple:
         """在 parent 内创建人物多选控件（候选列表 + 新增输入行），返回 (selected_names, refill)。
@@ -684,9 +690,7 @@ class ChatSorterApp(tk.Tk):
             name = new_var.get().strip()
             if not name:
                 return
-            if name not in self._custom_people and name not in {
-                c.rel_display for c in self.candidates if c.depth == 1
-            }:
+            if name not in self._custom_people:
                 self._custom_people.append(name)  # 列表外人物持久保存，下次仍在
                 self._save_cache_file()
             entry.delete(0, "end")
@@ -700,7 +704,7 @@ class ChatSorterApp(tk.Tk):
         """把人物标注应用到消息、持久化缓存与表格行（由详情窗口“保存并关闭”调用）。"""
         item = self.assignments[int(row)]
         msg = item["message"]
-        msg.people = core.normalize_people(people)
+        msg.people = core.ensure_self(people)
         self._msg_people[core.message_key(msg)] = list(msg.people)
         self._save_cache_file()
         values = list(self.tree.item(row, "values"))

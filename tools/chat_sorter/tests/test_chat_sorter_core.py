@@ -201,6 +201,17 @@ def test_message_key_stable() -> None:
     assert core.message_key(a) != core.message_key(d)
 
 
+def test_ensure_self() -> None:
+    # 涉及人员固定包含“我”，放最前
+    assert core.ensure_self(["张三", "李四"]) == ["我", "张三", "李四"]
+    # 已有“我”时去重，不重复添加
+    assert core.ensure_self(["张三", "我"]) == ["我", "张三"]
+    # 空标注保持为空（视为未标注，不导出、不写后缀）
+    assert core.ensure_self([]) == []
+    # 空名被清理
+    assert core.ensure_self(["", "张三", "张三"]) == ["我", "张三"]
+
+
 def test_cache_save_load_roundtrip(tmp_path: Path) -> None:
     path = tmp_path / "classify_cache.json"
     cache = {
