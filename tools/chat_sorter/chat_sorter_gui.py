@@ -641,18 +641,30 @@ class ChatSorterApp(tk.Tk):
             self._set_row_discard(int(iid), iid, discarded)
         self._refresh_confirm_label()
 
+    def _people_counts(self) -> dict[str, int]:
+        """统计每个人物在历史标注（缓存中全部）里被引用的次数。"""
+        counts: dict[str, int] = {}
+        for people in self._msg_people.values():
+            for name in people:
+                if name != core.SELF_PERSON:
+                    counts[name] = counts.get(name, 0) + 1
+        return counts
+
     def _people_choices(self, extra: list[str] | None = None) -> list[str]:
         """人物候选名单：用户新增人物 + 所有已标注过的人物，固定包含“我”。
 
         不再从目录列表的文件夹名取人物，只认用户输入/选择过的名字。
+        排序：按历史标注中被引用的次数降序（次数多者靠前），同次数按名字，
+        “我”固定排最前。
         """
+        counts = self._people_counts()
         names = set(self._custom_people)
-        for people in self._msg_people.values():
-            names.update(people)
+        names.update(counts)
         if extra:
             names.update(extra)
         names.discard(core.SELF_PERSON)
-        return [core.SELF_PERSON] + sorted(names)
+        ranked = sorted(names, key=lambda n: (-counts.get(n, 0), n))
+        return [core.SELF_PERSON] + ranked
 
     def _build_people_selector(self, parent, msg) -> tuple:
         """在 parent 内创建人物选择控件（全量点选 + 输入联想），返回 (selected_names, refill)。
@@ -693,8 +705,10 @@ class ChatSorterApp(tk.Tk):
         def rebuild_palette() -> None:
             for child in palette_frame.winfo_children():
                 child.destroy()
+            counts = self._people_counts()
             names = [core.SELF_PERSON] + sorted(
-                (set(self._people_choices()) | selected) - {core.SELF_PERSON}
+                (set(self._people_choices()) | selected) - {core.SELF_PERSON},
+                key=lambda n: (-counts.get(n, 0), n),  # 引用次数多者靠前
             )
             for i, name in enumerate(names):
                 row, col = divmod(i, 5)  # 每行最多 5 个，超出自动换行
