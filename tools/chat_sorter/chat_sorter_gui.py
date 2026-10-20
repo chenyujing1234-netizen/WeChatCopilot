@@ -793,8 +793,9 @@ class ChatSorterApp(tk.Tk):
         self.confirm_btn.configure(text=f"确认写入（{count} 条）")
 
     def _export_people_messages(self) -> None:
-        """把所有标注了“涉及人物”的消息（废弃行除外）导出到同一个 txt，路径用户选择。
+        """把所有标注了“涉及人物”的消息（废弃行除外）合并导出到一个 txt。
 
+        保存目录由用户选择，文件固定为“涉及人员消息.txt”；
         格式：每条消息上方一行“==== 涉及人员：A、B ====”，下面是原始消息行。
         """
         rows = [
@@ -805,21 +806,21 @@ class ChatSorterApp(tk.Tk):
         if not rows:
             messagebox.showinfo("无可导出数据", "当前没有标注“涉及人物”的消息行。")
             return
-        path = filedialog.asksaveasfilename(
-            title="导出人物消息",
-            defaultextension=".txt",
-            filetypes=[("文本文件", "*.txt")],
-            initialfile="涉及人员消息.txt",
-        )
-        if not path:
+        directory = filedialog.askdirectory(title="选择人物消息的保存目录")
+        if not directory:
             return  # 用户取消
+        path = Path(directory) / "涉及人员消息.txt"
+        if path.exists() and not messagebox.askyesno(
+            "覆盖确认", f"{path} 已存在，覆盖写入吗？"
+        ):
+            return
         blocks = []
         for item in rows:
             msg = item["message"]
             people = "、".join(self._msg_people[core.message_key(msg)])
             blocks.append(f"==== 涉及人员：{people} ====\n{msg.line}")
         try:
-            Path(path).write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+            path.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
         except OSError as exc:
             messagebox.showerror("导出失败", str(exc))
             return
