@@ -158,8 +158,8 @@ class ChatSorterApp(tk.Tk):
         ttk.Button(
             assign, text="全不选", command=lambda: self.tree.selection_remove(self.tree.selection())
         ).pack(side="left")
-        # 隐藏废弃项：勾选后表格中不显示已废弃（系统/附件 + 手动标记）的行
-        self.hide_discarded_var = tk.BooleanVar(value=False)
+        # 隐藏废弃项：默认勾选，表格中不显示已废弃（系统/附件 + 手动标记）的行
+        self.hide_discarded_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             assign, text="隐藏废弃项", variable=self.hide_discarded_var,
             command=self._apply_hide_discarded,
