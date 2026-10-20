@@ -195,6 +195,10 @@ class ChatSorterApp(tk.Tk):
         bottom.pack(fill="x")
         self.confirm_btn = ttk.Button(bottom, text="确认写入", command=self._confirm_write, state="disabled")
         self.confirm_btn.pack(side="left")
+        self.export_people_btn = ttk.Button(
+            bottom, text="导出人物消息", command=self._export_people_messages, state="disabled"
+        )
+        self.export_people_btn.pack(side="left", padx=(10, 0))
         ttk.Label(
             bottom, text="“确认写入”后才会把消息真正追加到各目录的 txt 文件中（已存在的行自动跳过）。"
         ).pack(side="left", padx=10)
@@ -282,6 +286,7 @@ class ChatSorterApp(tk.Tk):
         self.dir_combo.set(UNCLASSIFIED)
         self.dir_combo.configure(state="readonly")
         self.apply_btn.configure(state="normal")
+        self.export_people_btn.configure(state="normal")
         discarded_cnt = sum(1 for a in self.assignments if a["discarded"])
         self.status_var.set(
             f"已加载 {len(messages)} 条消息、{len(candidates)} 个候选目录"
@@ -786,6 +791,46 @@ class ChatSorterApp(tk.Tk):
     def _refresh_confirm_label(self) -> None:
         count = sum(1 for item in self.assignments if item["target"])
         self.confirm_btn.configure(text=f"确认写入（{count} 条）")
+
+    def _export_people_messages(self) -> None:
+        """把所有标注了“涉及人物”的消息（废弃行除外）导出到同一个 txt，路径用户选择。
+
+        格式：每条消息上方一行“==== 涉及人员：A、B ====”，下面是原始消息行。
+        """
+        rows = [
+            item for item in self.assignments
+            if not item["discarded"]
+            and self._msg_people.get(core.message_key(item["message"]))
+        ]
+        if not rows:
+            messagebox.showinfo("无可导出数据", "当前没有标注“涉及人物”的消息行。")
+            return
+        path = filedialog.asksaveasfilename(
+            title="导出人物消息",
+            defaultextension=".txt",
+            filetypes=[("文本文件", "*.txt")],
+            initialfile="涉及人员消息.txt",
+        )
+        if not path:
+            return  # 用户取消
+        blocks = []
+        for item in rows:
+            msg = item["message"]
+            people = "、".join(self._msg_people[core.message_key(msg)])
+            blocks.append(f"==== 涉及人员：{people} ====\n{msg.line}")
+        try:
+            Path(path).write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("导出失败", str(exc))
+            return
+        skipped = sum(
+            1 for item in self.assignments
+            if item["discarded"] and self._msg_people.get(core.message_key(item["message"]))
+        )
+        self.status_var.set(
+            f"已导出 {len(rows)} 条人物消息到 {path}"
+            + (f"（{skipped} 条废弃行未导出）" if skipped else "")
+        )
 
     def _confirm_write(self) -> None:
         discarded_cnt = sum(1 for item in self.assignments if item["discarded"])
