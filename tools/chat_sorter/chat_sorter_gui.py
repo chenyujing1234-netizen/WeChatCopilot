@@ -657,7 +657,8 @@ class ChatSorterApp(tk.Tk):
     def _build_people_selector(self, parent, msg) -> tuple:
         """在 parent 内创建人物选择控件（全量点选 + 输入联想），返回 (selected_names, refill)。
 
-        所有可选人物平铺为按钮，点击切换选中（“✓”前缀表示已选；“我”固定选中）；
+        所有可选人物平铺为按钮，点击切换选中（“✓”前缀表示已选）；
+        “我”始终排在第一位，允许只选“我”一个（保存时非空标注自动包含“我”）。
         输入框打字即时联想，回车或双击加入；输入全新名字回车即新增人物。
         selected_names() 返回当前已选人物集合；refill(select) 以新集合重建面板。
         """
@@ -704,8 +705,6 @@ class ChatSorterApp(tk.Tk):
                 ).grid(row=row, column=col, sticky="w", padx=(0, 10), pady=2)
 
         def toggle(name: str) -> None:
-            if name == core.SELF_PERSON:
-                return  # “我”固定选中，不可取消
             if name in selected:
                 selected.discard(name)
             else:
