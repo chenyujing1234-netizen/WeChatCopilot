@@ -983,7 +983,7 @@ class ChatSorterApp(tk.Tk):
         self._save_cache_file()
 
     def _show_detail(self, row: str) -> None:
-        """双击行：弹出该行内容文本，并可在窗口内直接修改“涉及人物”。"""
+        """双击行：弹出该行内容文本（可选中复制），并可在窗口内修改“涉及人物”。"""
         if not self.assignments:
             messagebox.showinfo("未加载数据", "请先点击“加 载”展示消息。")
             return
@@ -1029,7 +1029,46 @@ class ChatSorterApp(tk.Tk):
         text = scrolledtext.ScrolledText(win, wrap="word")
         text.pack(fill="both", expand=True, padx=12, pady=(6, 10))
         text.insert("1.0", msg.content.replace("\\n", "\n"))
-        text.configure(state="disabled")
+
+        def copy_selection() -> None:
+            sel = text.tag_ranges("sel")
+            if sel:
+                self.clipboard_clear()
+                self.clipboard_append(text.get(sel[0], sel[-1]))
+                self.status_var.set("选中内容已复制到剪贴板。")
+
+        def copy_all() -> None:
+            self.clipboard_clear()
+            self.clipboard_append(text.get("1.0", "end-1c"))
+            self.status_var.set("消息内容已复制到剪贴板。")
+
+        def _readonly_keys(event) -> str | None:
+            # 只读但可复制：Ctrl+A 放行给默认全选，Ctrl+C 复制选中内容，
+            # 其余按键（输入、粘贴、剪切、撤销）一律拦截，内容不可被修改
+            if event.state & 0x4 and event.keysym.lower() == "a":
+                return None
+            if event.state & 0x4 and event.keysym.lower() == "c":
+                copy_selection()
+                return "break"
+            return "break"
+
+        # Windows 下 Ctrl+V 等还会以 <<Paste>> 虚拟事件派发（<Key> 拦不到），
+        # 编辑类虚拟事件单独绑定拦截；复制走 Ctrl+C 处理与右键菜单
+        for virt in ("<<Paste>>", "<<Cut>>", "<<Undo>>", "<<Redo>>"):
+            text.bind(virt, lambda _e: "break")
+        text.bind("<Key>", _readonly_keys)
+        text.focus_set()
+
+        # 右键菜单：全选 / 复制选中 / 复制全部
+        menu = tk.Menu(win, tearoff=0)
+        menu.add_command(label="全选", command=lambda: text.tag_add("sel", "1.0", "end"))
+        menu.add_command(label="复制选中", command=copy_selection)
+        menu.add_command(label="复制全部内容", command=copy_all)
+        text.bind("<Button-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
+
+        ttk.Button(btn_row, text="复制全部内容", command=copy_all).pack(
+            side="left", padx=4, before=save_btn
+        )
 
 
 if __name__ == "__main__":
