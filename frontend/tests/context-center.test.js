@@ -98,6 +98,34 @@ describe('上下文中心首页', () => {
     expect(w.text()).toContain('加载已解压的扩展程序')
   })
 
+  it('Chrome 已在运行时不重复启动并给出提示', async () => {
+    api.openBrowserExtensionPage.mockReset().mockResolvedValue({ status: 'ok', ok: true, already_running: true })
+    const w = await mountHome()
+    await w.findAll('button').find(b => b.text() === '浏览器记录').trigger('click')
+    await flushPromises()
+    await w.findAll('button').find(b => b.text() === '安装插件').trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('检测到 Chrome 已在运行，未重复启动')
+    expect(w.text()).toContain('chrome://extensions/')
+    expect(w.text()).toContain('加载已解压的扩展程序')
+  })
+
+  it('复制路径后安装步骤说明仍保持显示', async () => {
+    vi.stubGlobal('navigator', { clipboard: { writeText: vi.fn().mockResolvedValue() } })
+    const w = await mountHome()
+    await w.findAll('button').find(b => b.text() === '浏览器记录').trigger('click')
+    await flushPromises()
+    await w.findAll('button').find(b => b.text() === '安装插件').trigger('click')
+    await flushPromises()
+    const steps = '插件副本已生成（上传地址已指向本机），已打开浏览器扩展管理页，请按以下步骤完成安装：'
+    expect(w.text()).toContain(steps)
+    await w.findAll('button').find(b => b.text() === '复制路径').trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain(steps)
+    expect(w.text()).toContain('加载已解压的扩展程序')
+    expect(w.text()).toContain('已复制')
+  })
+
   it('点击平台卡片打开对应 GPT 平台网站', async () => {
     const w = await mountHome()
     await w.findAll('button').find(b => b.text() === '浏览器记录').trigger('click')

@@ -236,6 +236,7 @@ def test_open_extensions_page_launches_found_exe_directly(monkeypatch):
     """找到浏览器时直接以可执行文件 + URL 启动，绝不走系统默认打开（会弹选择应用框）。"""
     launched: list[list[str]] = []
     monkeypatch.setattr(bh, "_candidate_browser_exes", lambda kind: [r"C:\fake\chrome.exe"] if kind == "chrome" else [])
+    monkeypatch.setattr(bh, "_is_browser_process_running", lambda kind: False)
     monkeypatch.setattr("subprocess.Popen", lambda args, **kw: launched.append(args))
     if hasattr(os, "startfile"):
         monkeypatch.setattr(os, "startfile", lambda *a, **kw: pytest.fail("不应调用 os.startfile"))
@@ -257,3 +258,34 @@ def test_open_extensions_page_without_browser_returns_error(monkeypatch):
 
     assert result["ok"] is False
     assert "chrome://extensions/" in result["error"]
+
+
+def test_open_extensions_page_skips_launch_when_browser_running(monkeypatch):
+    """浏览器已在运行时不再重复启动，返回 already_running 标记。"""
+    monkeypatch.setattr(bh, "_candidate_browser_exes", lambda kind: [r"C:\fake\chrome.exe"] if kind == "chrome" else [])
+    monkeypatch.setattr(bh, "_is_browser_process_running", lambda kind: kind == "chrome")
+    monkeypatch.setattr("subprocess.Popen", lambda args, **kw: pytest.fail("浏览器已在运行时不应再启动"))
+
+    result = bh.open_extensions_page("chrome")
+
+    assert result["ok"] is True
+    assert result["already_running"] is True
+    assert result["url"] == "chrome://extensions/"
+
+
+def test_is_browser_process_running_parses_tasklist(monkeypatch):
+    class _FakeCompleted:
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *a, **kw: _FakeCompleted('"chrome.exe","1234","Console","1","100 K"'),
+    )
+    assert bh._is_browser_process_running("chrome") is True
+
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *a, **kw: _FakeCompleted("信息: 没有运行的任务匹配指定标准。"),
+    )
+    assert bh._is_browser_process_running("chrome") is False

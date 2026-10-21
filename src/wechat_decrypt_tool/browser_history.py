@@ -988,18 +988,41 @@ def _candidate_browser_exes(kind: str) -> list[str]:
     return result
 
 
+def _is_browser_process_running(kind: str) -> bool:
+    """检查浏览器进程是否在运行（Windows 下用 tasklist 查询）。"""
+    if os.name != "nt":
+        return False
+    import subprocess
+
+    exe_name = f"{kind}.exe"
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {exe_name}", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return exe_name.lower() in (result.stdout or "").lower()
+
+
 def open_extensions_page(browser: str = "chrome") -> dict[str, Any]:
     """直接用浏览器可执行文件打开扩展管理页，不弹系统「选择应用」对话框。
 
-    chrome.exe 带上 chrome://extensions/ 参数启动：浏览器已打开则直接在现有窗口
-    新开标签页，未打开则自动启动浏览器。Chrome 找不到时自动降级 Edge。
+    浏览器已在运行则不再重复启动（返回 already_running 标记）；未运行才启动，
+    chrome.exe 带上 chrome://extensions/ 参数启动后自动打开扩展管理页。
+    Chrome 找不到时自动降级 Edge。
     """
     import subprocess
 
     order = ["edge"] if browser == "edge" else ["chrome", "edge"]
     for kind in order:
-        for exe in _candidate_browser_exes(kind):
-            url = _EXTENSION_PAGE_URLS[kind]
+        exes = _candidate_browser_exes(kind)
+        if not exes:
+            continue
+        url = _EXTENSION_PAGE_URLS[kind]
+        if _is_browser_process_running(kind):
+            return {"ok": True, "browser": kind, "url": url, "already_running": True}
+        for exe in exes:
             try:
                 subprocess.Popen([exe, url], close_fds=True)
             except OSError:

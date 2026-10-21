@@ -194,6 +194,7 @@
               >
                 复制路径
               </button>
+              <span v-if="copyMessage" class="shrink-0 text-[#07c160]">{{ copyMessage }}</span>
             </div>
           </div>
         </div>
@@ -312,6 +313,7 @@ const browserHistoryEnabled = ref(true)
 const extensionInstall = ref(null) // {installed, installations[], extension_dir}
 const extensionDir = ref('')
 const installMessage = ref('')
+const copyMessage = ref('')
 
 // 全量平台列表（与后端一致）：无数据的也展示，方便点击打开
 const ALL_GPT_PLATFORMS = [
@@ -364,15 +366,19 @@ const checkExtension = async (showResult = true) => {
 
 const installExtension = async () => {
   installingExtension.value = true
+  copyMessage.value = ''
   try {
     const resp = await prepareBrowserExtension()
     extensionDir.value = resp?.extension_dir || ''
     const pageResp = await openBrowserExtensionPage('chrome')
     const opened = pageResp?.ok !== false
+    const alreadyRunning = pageResp?.already_running === true
     installMessage.value = [
-      opened
-        ? '插件副本已生成（上传地址已指向本机），已打开浏览器扩展管理页，请按以下步骤完成安装：'
-        : '插件副本已生成。未能自动打开浏览器，请先手动打开 Chrome，在地址栏输入 chrome://extensions/ 进入扩展管理页，再按以下步骤完成安装：',
+      !opened
+        ? '插件副本已生成。未能自动打开浏览器，请先手动打开 Chrome，在地址栏输入 chrome://extensions/ 进入扩展管理页，再按以下步骤完成安装：'
+        : alreadyRunning
+          ? '插件副本已生成（上传地址已指向本机）。检测到 Chrome 已在运行，未重复启动，请在已打开的 Chrome 中进入扩展管理页（地址栏输入 chrome://extensions/），按以下步骤完成安装：'
+          : '插件副本已生成（上传地址已指向本机），已打开浏览器扩展管理页，请按以下步骤完成安装：',
       '1. 在扩展管理页右上角打开「开发者模式」；',
       '2. 点「加载已解压的扩展程序」，选择下面这个目录；',
       '3. 安装完成后回到这里点「检查是否已安装」确认。'
@@ -387,9 +393,9 @@ const installExtension = async () => {
 const copyExtensionDir = async () => {
   try {
     await navigator.clipboard.writeText(extensionDir.value)
-    installMessage.value = '扩展目录路径已复制。'
+    copyMessage.value = '已复制'
   } catch {
-    installMessage.value = '复制失败，请手动选中路径复制。'
+    copyMessage.value = '复制失败，请手动选中路径复制'
   }
 }
 
