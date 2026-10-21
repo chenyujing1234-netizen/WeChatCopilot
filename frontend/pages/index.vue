@@ -13,8 +13,28 @@
         {{ error }}
       </div>
 
+      <!-- 数据源切换：微信数据 / 浏览器记录 -->
+      <div class="mt-8 flex items-center gap-2">
+        <button
+          type="button"
+          class="rounded-full px-4 py-1.5 text-[13px] font-medium transition"
+          :class="activeCard === 'wechat' ? 'bg-[#07c160] text-white' : 'bg-white text-[#5f5f5f] border border-[#e8e8e8] hover:border-[#07c160] hover:text-[#07c160]'"
+          @click="switchCard('wechat')"
+        >
+          微信数据
+        </button>
+        <button
+          type="button"
+          class="rounded-full px-4 py-1.5 text-[13px] font-medium transition"
+          :class="activeCard === 'browser' ? 'bg-[#07c160] text-white' : 'bg-white text-[#5f5f5f] border border-[#e8e8e8] hover:border-[#07c160] hover:text-[#07c160]'"
+          @click="switchCard('browser')"
+        >
+          浏览器记录
+        </button>
+      </div>
+
       <!-- 微信上下文卡片 -->
-      <section class="mt-8 rounded-[14px] border border-[#e8e8e8] bg-white p-6 shadow-[0_10px_40px_-24px_rgba(0,0,0,0.35)]">
+      <section v-if="activeCard === 'wechat'" class="mt-4 rounded-[14px] border border-[#e8e8e8] bg-white p-6 shadow-[0_10px_40px_-24px_rgba(0,0,0,0.35)]">
         <div class="flex items-start justify-between gap-4">
           <div class="min-w-0">
             <div class="flex items-center gap-2">
@@ -111,6 +131,118 @@
         <p v-if="syncMessage" class="mt-3 text-[12px] leading-5" :class="syncMessageOk ? 'text-[#07964c]' : 'text-red-500'">{{ syncMessage }}</p>
       </section>
 
+      <!-- 浏览器记录卡片：GPT 平台对话数据（配合「AI对话导出」浏览器扩展） -->
+      <section v-else class="mt-4 rounded-[14px] border border-[#e8e8e8] bg-white p-6 shadow-[0_10px_40px_-24px_rgba(0,0,0,0.35)]">
+        <div class="flex items-start justify-between gap-4">
+          <div class="min-w-0">
+            <div class="flex items-center gap-2">
+              <h2 class="text-[16px] font-semibold text-[#000000e6]">浏览器记录</h2>
+              <span
+                class="rounded-full px-2 py-0.5 text-[11px] font-medium"
+                :class="extensionInstalled ? 'bg-[#eefbf4] text-[#07964c]' : 'bg-[#fff7e6] text-[#b7791f]'"
+              >
+                {{ extensionInstalled ? '扩展已安装' : '扩展未安装' }}
+              </span>
+            </div>
+            <p class="mt-2 text-[13px] leading-6 text-[#7F7F7F]">
+              配合「AI对话导出」浏览器扩展，在 DeepSeek、豆包、Kimi、腾讯元宝、纳米AI、通义千问、讯飞星火等平台自动抓取对话，一键同步到本机。
+            </p>
+          </div>
+          <label class="flex shrink-0 cursor-pointer items-center gap-2 text-[12px] text-[#5f5f5f]" title="浏览器记录总开关">
+            <span>启用</span>
+            <input
+              type="checkbox"
+              class="h-[18px] w-[18px] accent-[#07c160]"
+              :checked="browserHistoryEnabled"
+              :disabled="togglingBrowser"
+              @change="toggleBrowserHistoryEnabled"
+            />
+          </label>
+        </div>
+
+        <!-- 扩展安装管理 -->
+        <div class="mt-5 rounded-[10px] bg-[#fafafa] px-4 py-3 text-[12px] text-[#5f5f5f]">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="shrink-0 text-[#8a8a8a]">浏览器扩展</span>
+            <span class="min-w-0 flex-1 truncate font-medium text-[#222]">{{ extensionStatusText }}</span>
+            <button
+              type="button"
+              class="shrink-0 cursor-pointer text-[#07c160] hover:underline disabled:cursor-not-allowed disabled:opacity-60"
+              :disabled="checkingExtension"
+              @click="checkExtension"
+            >
+              {{ checkingExtension ? '正在检查…' : '检查是否已安装' }}
+            </button>
+            <button
+              type="button"
+              class="shrink-0 cursor-pointer text-[#07c160] hover:underline disabled:cursor-not-allowed disabled:opacity-60"
+              :disabled="installingExtension"
+              @click="installExtension"
+            >
+              {{ installingExtension ? '正在准备…' : '安装插件' }}
+            </button>
+          </div>
+          <div v-if="installMessage" class="mt-2 rounded-[8px] bg-white px-3 py-2 leading-6 text-[#222]">
+            <p class="whitespace-pre-line">{{ installMessage }}</p>
+            <div v-if="extensionDir" class="mt-1 flex items-center gap-2">
+              <span class="text-[#8a8a8a]">扩展目录：</span>
+              <code class="min-w-0 flex-1 truncate rounded bg-[#f2f2f2] px-2 py-1 text-[11px]">{{ extensionDir }}</code>
+              <button
+                type="button"
+                class="shrink-0 cursor-pointer text-[#07c160] hover:underline"
+                @click="copyExtensionDir"
+              >
+                复制路径
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 数据概况 -->
+        <div class="mt-3 grid grid-cols-2 gap-3 rounded-[10px] bg-[#fafafa] px-4 py-3 text-[12px] text-[#5f5f5f] md:grid-cols-3">
+          <div>
+            <div class="text-[#8a8a8a]">已同步会话</div>
+            <div class="mt-1 font-medium text-[#222]">{{ browserSummary.total_conversations ?? 0 }}</div>
+          </div>
+          <div>
+            <div class="text-[#8a8a8a]">已同步消息</div>
+            <div class="mt-1 font-medium text-[#222]">{{ browserSummary.total_messages ?? 0 }}</div>
+          </div>
+          <div>
+            <div class="text-[#8a8a8a]">最近同步</div>
+            <div class="mt-1 font-medium text-[#222]">{{ browserSummary.last_uploaded_at || '尚未同步' }}</div>
+          </div>
+        </div>
+
+        <!-- 各 GPT 平台：点击打开平台网站，装好扩展后打开对话即自动抓取 -->
+        <div class="mt-5">
+          <div class="flex items-center justify-between">
+            <h3 class="text-[13px] font-semibold text-[#000000e6]">GPT 平台（点击打开，扩展自动抓取对话）</h3>
+            <span class="text-[11px] text-[#8a8a8a]">在平台打开对话后，用页面右侧悬浮按钮上传</span>
+          </div>
+          <div class="mt-3 grid grid-cols-1 gap-2 md:grid-cols-2">
+            <div
+              v-for="p in browserPlatforms"
+              :key="p.code"
+              class="flex cursor-pointer items-center justify-between gap-3 rounded-[10px] border border-[#e8e8e8] px-4 py-2.5 text-[12px] transition hover:border-[#07c160]"
+              :title="`打开 ${p.name}`"
+              @click="openPlatform(p)"
+            >
+              <div class="min-w-0">
+                <div class="font-medium text-[#222]">{{ p.name }}</div>
+                <div class="mt-0.5 text-[11px] text-[#8a8a8a]">{{ p.url }}</div>
+              </div>
+              <div class="shrink-0 text-right">
+                <div class="font-medium text-[#222]">
+                  {{ p.conversations ? `${p.conversations} 会话 / ${p.messages} 条消息` : '暂无同步数据' }}
+                </div>
+                <div class="mt-0.5 text-[11px] text-[#8a8a8a]">{{ p.last_received_at ? `最近同步：${p.last_received_at}` : '未同步' }}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <!-- 规划中的数据源 -->
       <section class="mt-8">
         <h3 class="text-[14px] font-semibold text-[#000000e6]">更多上下文来源（规划中）</h3>
@@ -154,7 +286,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 
-const { getContextSources, getContextSettings, updateContextSettings, triggerWechatSync } = useApi()
+const { getContextSources, getContextSettings, updateContextSettings, triggerWechatSync, getBrowserHistoryStatus, prepareBrowserExtension, openBrowserExtensionPage, openGptPlatform } = useApi()
 
 const sources = ref([])
 const wechatEnabled = ref(true)
@@ -167,8 +299,122 @@ const syncMessageOk = ref(true)
 const exportDialogOpen = ref(false)
 
 const wechatSource = computed(() => sources.value.find(s => s.source_id === 'wechat') || null)
-const plannedSources = computed(() => sources.value.filter(s => s.source_id !== 'wechat'))
+const browserSource = computed(() => sources.value.find(s => s.source_id === 'browser_history') || null)
+const plannedSources = computed(() => sources.value.filter(s => !['wechat', 'browser_history'].includes(s.source_id)))
 const wechatSummary = computed(() => wechatSource.value?.summary || {})
+
+// ---------- 浏览器记录（GPT 平台对话抓取扩展） ----------
+const activeCard = ref('wechat')
+const checkingExtension = ref(false)
+const installingExtension = ref(false)
+const togglingBrowser = ref(false)
+const browserHistoryEnabled = ref(true)
+const extensionInstall = ref(null) // {installed, installations[], extension_dir}
+const extensionDir = ref('')
+const installMessage = ref('')
+
+// 全量平台列表（与后端一致）：无数据的也展示，方便点击打开
+const ALL_GPT_PLATFORMS = [
+  { code: 'deepseek', name: 'DeepSeek', url: 'https://chat.deepseek.com/' },
+  { code: 'ncn', name: '纳米AI', url: 'https://bot.n.cn/' },
+  { code: 'yuanbao', name: '腾讯元宝', url: 'https://yuanbao.tencent.com/' },
+  { code: 'kimi', name: 'Kimi', url: 'https://kimi.com/' },
+  { code: 'qianwen', name: '通义千问', url: 'https://www.tongyi.com/' },
+  { code: 'iflytek', name: '讯飞星火', url: 'https://xinghuo.xfyun.cn/' },
+  { code: 'doubao', name: '豆包', url: 'https://www.doubao.com/chat/' }
+]
+
+const browserSummary = computed(() => browserSource.value?.summary || {})
+const extensionInstalled = computed(() => !!(extensionInstall.value?.installed || browserSummary.value?.extension?.installed))
+const extensionStatusText = computed(() => {
+  const info = extensionInstall.value || browserSummary.value?.extension
+  const inst = info?.installations?.[0]
+  if (info?.installed) return inst ? `${info.extension_name} · ${inst.browser} ${inst.profile}` : `${info.extension_name} · 已安装`
+  return '未检测到「AI对话导出」扩展'
+})
+const browserPlatforms = computed(() => {
+  const stats = {}
+  for (const p of browserSummary.value?.platforms || []) stats[p.code] = p
+  return ALL_GPT_PLATFORMS.map(p => ({ ...p, ...(stats[p.code] || {}) }))
+})
+
+const switchCard = (card) => {
+  activeCard.value = card
+  if (card === 'browser') void checkExtension(false)
+}
+
+const checkExtension = async (showResult = true) => {
+  checkingExtension.value = true
+  try {
+    const resp = await getBrowserHistoryStatus()
+    extensionInstall.value = resp || null
+    if (resp?.extension_dir) extensionDir.value = resp.extension_dir
+    if (showResult) {
+      installMessage.value = resp?.installed
+        ? `已检测到扩展（${(resp.installations || []).map(i => `${i.browser} ${i.profile}`).join('、') || '已安装'}），在 GPT 平台打开对话即可抓取。`
+        : '未检测到扩展，请点「安装插件」按步骤安装。'
+    }
+    await reload()
+  } catch (e) {
+    if (showResult) installMessage.value = e?.message || '检查扩展安装状态失败'
+  } finally {
+    checkingExtension.value = false
+  }
+}
+
+const installExtension = async () => {
+  installingExtension.value = true
+  try {
+    const resp = await prepareBrowserExtension()
+    extensionDir.value = resp?.extension_dir || ''
+    const pageResp = await openBrowserExtensionPage('chrome')
+    const opened = pageResp?.ok !== false
+    installMessage.value = [
+      opened
+        ? '插件副本已生成（上传地址已指向本机），已打开浏览器扩展管理页，请按以下步骤完成安装：'
+        : '插件副本已生成。未能自动打开浏览器，请先手动打开 Chrome，在地址栏输入 chrome://extensions/ 进入扩展管理页，再按以下步骤完成安装：',
+      '1. 在扩展管理页右上角打开「开发者模式」；',
+      '2. 点「加载已解压的扩展程序」，选择下面这个目录；',
+      '3. 安装完成后回到这里点「检查是否已安装」确认。'
+    ].join('\n')
+  } catch (e) {
+    installMessage.value = e?.message || '生成扩展副本失败'
+  } finally {
+    installingExtension.value = false
+  }
+}
+
+const copyExtensionDir = async () => {
+  try {
+    await navigator.clipboard.writeText(extensionDir.value)
+    installMessage.value = '扩展目录路径已复制。'
+  } catch {
+    installMessage.value = '复制失败，请手动选中路径复制。'
+  }
+}
+
+const toggleBrowserHistoryEnabled = async (event) => {
+  const enabled = !!event?.target?.checked
+  togglingBrowser.value = true
+  browserHistoryEnabled.value = enabled
+  try {
+    await updateContextSettings({ browser_history: { enabled } })
+    await reload()
+  } catch (e) {
+    browserHistoryEnabled.value = !enabled
+    error.value = e?.message || '保存浏览器记录开关失败'
+  } finally {
+    togglingBrowser.value = false
+  }
+}
+
+const openPlatform = async (p) => {
+  try {
+    await openGptPlatform(p.url)
+  } catch (e) {
+    error.value = e?.message || '打开平台失败'
+  }
+}
 
 const STATE_TEXT = {
   idle: '待自动保存',
@@ -198,6 +444,9 @@ const reload = async () => {
     ])
     sources.value = sourcesResp?.sources || []
     wechatEnabled.value = !!(settingsResp?.settings?.wechat?.enabled)
+    browserHistoryEnabled.value = settingsResp?.settings?.browser_history
+      ? !!(settingsResp.settings.browser_history.enabled)
+      : true
   } catch (e) {
     error.value = e?.message || '加载上下文状态失败'
   } finally {

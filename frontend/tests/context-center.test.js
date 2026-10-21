@@ -6,7 +6,11 @@ const api = {
   getContextSources: vi.fn(),
   getContextSettings: vi.fn(),
   updateContextSettings: vi.fn(),
-  triggerWechatSync: vi.fn()
+  triggerWechatSync: vi.fn(),
+  getBrowserHistoryStatus: vi.fn(),
+  prepareBrowserExtension: vi.fn(),
+  openBrowserExtensionPage: vi.fn(),
+  openGptPlatform: vi.fn()
 }
 let wrapper
 let navigateToMock
@@ -15,7 +19,7 @@ const sourcesPayload = () => ({
   status: 'ok',
   sources: [
     { source_id: 'wechat', name: '微信数据', enabled: true, state: 'up_to_date', last_saved_at: '2026-10-14T10:00:00', summary: { accounts: 1, account: 'wxid_a', successful_databases: 12 }, planned: false, data_dir: '', data_dir_effective: 'C:\\Users\\dev\\AppData\\Roaming\\ContextBuddy\\output\\databases', archive_content: 'structured' },
-    { source_id: 'browser_history', name: '浏览器记录', enabled: false, state: 'planned', last_saved_at: null, summary: { description: '将以浏览器插件方式接入（豆包、Qwen 等浏览记录），插件随应用安装并可更新。' }, planned: true },
+    { source_id: 'browser_history', name: '浏览器记录', enabled: true, state: 'idle', last_saved_at: null, planned: false, summary: { platforms: [], total_conversations: 0, total_messages: 0, last_uploaded_at: null, extension: { installed: false, installations: [] } } },
     { source_id: 'computer_activity', name: '电脑操作记录', enabled: false, state: 'planned', last_saved_at: null, summary: { description: '记录本机操作行为' }, planned: true },
     { source_id: 'mobile_upload', name: '手机上传', enabled: false, state: 'planned', last_saved_at: null, summary: { description: '配合手机端 NextCloud 应用' }, planned: true },
     { source_id: 'custom_capture', name: '定制浏览器抓取', enabled: false, state: 'planned', last_saved_at: null, summary: { description: '自动生成定制浏览器插件' }, planned: true }
@@ -27,9 +31,13 @@ beforeEach(() => {
   vi.stubGlobal('useApi', () => api)
   vi.stubGlobal('navigateTo', navigateToMock)
   api.getContextSources.mockReset().mockImplementation(async () => sourcesPayload())
-  api.getContextSettings.mockReset().mockResolvedValue({ status: 'ok', settings: { wechat: { enabled: true } } })
-  api.updateContextSettings.mockReset().mockResolvedValue({ status: 'ok', settings: { wechat: { enabled: false } } })
+  api.getContextSettings.mockReset().mockResolvedValue({ status: 'ok', settings: { wechat: { enabled: true }, browser_history: { enabled: true } } })
+  api.updateContextSettings.mockReset().mockResolvedValue({ status: 'ok', settings: { wechat: { enabled: false }, browser_history: { enabled: true } } })
   api.triggerWechatSync.mockReset().mockResolvedValue({ status: 0, errmsg: 'ok', state: 'up_to_date', summary: { accounts: 1 } })
+  api.getBrowserHistoryStatus.mockReset().mockResolvedValue({ status: 'ok', installed: false, installations: [], extension_name: 'AI对话导出 word/json/md' })
+  api.prepareBrowserExtension.mockReset().mockResolvedValue({ status: 'ok', extension_dir: 'C:\\data\\browser_history\\extension', upload_url: 'http://127.0.0.1:10392' })
+  api.openBrowserExtensionPage.mockReset().mockResolvedValue({ status: 'ok' })
+  api.openGptPlatform.mockReset().mockResolvedValue({ status: 'ok' })
 })
 
 afterEach(() => { wrapper?.unmount(); vi.unstubAllGlobals() })
@@ -41,15 +49,63 @@ const mountHome = async () => {
 }
 
 describe('上下文中心首页', () => {
-  it('渲染微信卡片与四个规划中的数据源', async () => {
+  it('渲染微信卡片与三个规划中的数据源', async () => {
     const w = await mountHome()
     expect(w.text()).toContain('微信数据')
     expect(w.text()).toContain('已是最新')
     expect(w.text()).toContain('2026-10-14T10:00:00')
-    expect(w.text()).toContain('浏览器记录')
-    expect(w.text()).toContain('将以浏览器插件方式接入')
     const plannedBadges = w.findAll('.rounded-full').filter(b => b.text() === '规划中')
-    expect(plannedBadges).toHaveLength(4)
+    expect(plannedBadges).toHaveLength(3)
+  })
+
+  it('点击「浏览器记录」后主界面切换为浏览器记录信息', async () => {
+    const w = await mountHome()
+    await w.findAll('button').find(b => b.text() === '浏览器记录').trigger('click')
+    await flushPromises()
+    // 微信卡片区域被替换为浏览器记录卡片
+    expect(w.text()).toContain('浏览器记录')
+    expect(w.text()).toContain('扩展未安装')
+    expect(w.text()).toContain('检查是否已安装')
+    expect(w.text()).toContain('安装插件')
+    expect(w.text()).toContain('GPT 平台')
+    expect(w.text()).toContain('DeepSeek')
+    expect(w.text()).toContain('豆包')
+    expect(w.text()).not.toContain('立即保存')
+    expect(api.getBrowserHistoryStatus).toHaveBeenCalled()
+  })
+
+  it('安装插件生成副本并展示安装步骤说明', async () => {
+    const w = await mountHome()
+    await w.findAll('button').find(b => b.text() === '浏览器记录').trigger('click')
+    await flushPromises()
+    await w.findAll('button').find(b => b.text() === '安装插件').trigger('click')
+    await flushPromises()
+    expect(api.prepareBrowserExtension).toHaveBeenCalledTimes(1)
+    expect(api.openBrowserExtensionPage).toHaveBeenCalledWith('chrome')
+    expect(w.text()).toContain('加载已解压的扩展程序')
+    expect(w.text()).toContain('C:\\data\\browser_history\\extension')
+  })
+
+  it('浏览器未能自动打开时展示手动打开扩展管理页的引导', async () => {
+    api.openBrowserExtensionPage.mockReset().mockResolvedValue({ status: 'ok', ok: false, error: '未找到 Chrome/Edge 浏览器' })
+    const w = await mountHome()
+    await w.findAll('button').find(b => b.text() === '浏览器记录').trigger('click')
+    await flushPromises()
+    await w.findAll('button').find(b => b.text() === '安装插件').trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('未能自动打开浏览器')
+    expect(w.text()).toContain('chrome://extensions/')
+    expect(w.text()).toContain('加载已解压的扩展程序')
+  })
+
+  it('点击平台卡片打开对应 GPT 平台网站', async () => {
+    const w = await mountHome()
+    await w.findAll('button').find(b => b.text() === '浏览器记录').trigger('click')
+    await flushPromises()
+    const card = w.findAll('.cursor-pointer').find(el => el.text().includes('DeepSeek'))
+    await card.trigger('click')
+    await flushPromises()
+    expect(api.openGptPlatform).toHaveBeenCalledWith('https://chat.deepseek.com/')
   })
 
   it('切换自动保存开关调用设置接口', async () => {

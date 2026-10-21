@@ -22,7 +22,7 @@ _SETTINGS_LOCK = threading.Lock()
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "wechat": {"enabled": True, "data_dir": "", "archive_content": "structured"},
-    "browser_history": {"enabled": False},
+    "browser_history": {"enabled": True},
     "computer_activity": {"enabled": False},
     "mobile_upload": {"enabled": False},
     "custom_capture": {"enabled": False},
@@ -211,12 +211,7 @@ class WechatContextSource:
         WECHAT_AUTOSAVE.stop()
 
 
-BROWSER_HISTORY_SOURCE = PlannedStubSource(
-    "browser_history",
-    "浏览器记录",
-    "将以浏览器插件方式接入（豆包、Qwen 等浏览记录），插件随应用安装并可更新。",
-    extra={"plugin": {"install": "planned", "update": "planned"}},
-)
+from .browser_history import BROWSER_HISTORY_SOURCE
 COMPUTER_ACTIVITY_SOURCE = PlannedStubSource(
     "computer_activity",
     "电脑操作记录",

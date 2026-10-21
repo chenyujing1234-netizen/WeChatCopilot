@@ -1,0 +1,1106 @@
+"""浏览器记录数据源：对接「AI对话导出 word/json/md」浏览器扩展。
+
+扩展（DeepSeek/纳米AI/腾讯元宝/Kimi/通义千问/讯飞星火/豆包）在平台上拦截对话数据，
+一键上传到本服务；本模块提供：
+- 上传接收 API（与原 upload-server 协议兼容：POST /upload /check /batch-log）
+- 各平台消息归一化（移植自原 server.js，写入 SQLite）
+- 扩展副本管理（vendor → <data_dir>/browser_history/extension/，patch 上传地址）
+- 安装检测（扫描 Chrome/Edge 用户数据目录的扩展配置）
+- ContextSource 状态汇总（各平台已同步会话统计）
+"""
+
+from __future__ import annotations
+
+import datetime
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import shutil
+import sqlite3
+import threading
+from pathlib import Path
+from typing import Any, Optional
+from urllib.parse import urlparse
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
+
+from .app_paths import get_data_dir
+from .logging_config import get_logger
+
+logger = get_logger(__name__)
+
+# 与扩展副本一致的固定 token（仅本机回环使用，双方配对即可）
+UPLOAD_TOKEN = "525186097a4d4879266580c3c3e72cd9384d0eb50a1f52b7"
+# 上传服务端口：默认 10392，后端以其他端口启动时优先环境变量
+BACKEND_PORT = int(os.environ.get("WECHAT_TOOL_PORT") or 10392)
+UPLOAD_BASE_URL = f"http://127.0.0.1:{BACKEND_PORT}"
+EXTENSION_NAME = "AI对话导出 word/json/md"
+
+# 平台元数据：code 与扩展/上传协议一致
+PLATFORMS: list[dict[str, str]] = [
+    {"code": "deepseek", "name": "DeepSeek", "url": "https://chat.deepseek.com/"},
+    {"code": "ncn", "name": "纳米AI", "url": "https://bot.n.cn/"},
+    {"code": "yuanbao", "name": "腾讯元宝", "url": "https://yuanbao.tencent.com/"},
+    {"code": "kimi", "name": "Kimi", "url": "https://kimi.com/"},
+    {"code": "qianwen", "name": "通义千问", "url": "https://www.tongyi.com/"},
+    {"code": "tongyi", "name": "通义千问（旧版）", "url": "https://tongyi.com/"},
+    {"code": "iflytek", "name": "讯飞星火", "url": "https://xinghuo.xfyun.cn/"},
+    {"code": "doubao", "name": "豆包", "url": "https://www.doubao.com/chat/"},
+]
+PLATFORM_META = {p["code"]: p for p in PLATFORMS}
+
+_VENDOR_DIR = Path(__file__).parent / "browser_extension_src"
+
+
+# ---------------- 存储 ----------------
+
+def _browser_history_root() -> Path:
+    return get_data_dir() / "browser_history"
+
+
+def _db_path() -> Path:
+    return _browser_history_root() / "conversations.db"
+
+
+_DB_LOCK = threading.Lock()
+_DB_CONN: sqlite3.Connection | None = None
+
+
+def _get_db() -> sqlite3.Connection:
+    global _DB_CONN
+    if _DB_CONN is not None:
+        # 数据目录可能切换（测试/迁移），连接指向旧文件时重建
+        try:
+            current = _DB_CONN.execute("PRAGMA database_list").fetchone()[2]
+            if Path(current) != _db_path():
+                _DB_CONN.close()
+                _DB_CONN = None
+        except Exception:
+            _DB_CONN = None
+    if _DB_CONN is None:
+        root = _browser_history_root()
+        root.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(_db_path(), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform_code TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                title TEXT,
+                message_count INTEGER DEFAULT 0,
+                char_count INTEGER DEFAULT 0,
+                first_message_at TEXT,
+                last_message_at TEXT,
+                platform_created_at TEXT,
+                platform_updated_at TEXT,
+                content_hash TEXT,
+                received_at TEXT,
+                UNIQUE(platform_code, conversation_id)
+            );
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_row_id INTEGER NOT NULL,
+                platform_code TEXT NOT NULL,
+                message_id TEXT,
+                role TEXT,
+                seq INTEGER,
+                content TEXT,
+                thinking_content TEXT,
+                msg_time TEXT,
+                UNIQUE(conversation_row_id, message_id)
+            );
+            CREATE TABLE IF NOT EXISTS export_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_no TEXT,
+                platform_code TEXT,
+                batch_type TEXT,
+                conversation_count INTEGER DEFAULT 0,
+                message_count INTEGER DEFAULT 0,
+                total_chars INTEGER DEFAULT 0,
+                failed_count INTEGER DEFAULT 0,
+                client_version TEXT,
+                exported_at TEXT,
+                UNIQUE(batch_no)
+            );
+            """
+        )
+        conn.commit()
+        _DB_CONN = conn
+    return _DB_CONN
+
+
+def _now_iso() -> str:
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+# ---------------- 归一化（移植自原 upload-server server.js） ----------------
+
+def _to_dt(v: Any) -> str | None:
+    """秒/毫秒时间戳或时间字符串 → ISO 文本（无效返回 None）。"""
+    if v is None or v == "":
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        ms = v if v > 1e12 else (v * 1000 if v > 1e9 else None)
+        if ms is None:
+            return None
+        try:
+            return datetime.datetime.fromtimestamp(ms / 1000).isoformat(timespec="seconds")
+        except (ValueError, OSError, OverflowError):
+            return None
+    if isinstance(v, str):
+        s = v.strip()
+        if re.fullmatch(r"\d+(\.\d+)?", s):
+            return _to_dt(float(s))
+        try:
+            d = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return d.replace(tzinfo=None).isoformat(timespec="seconds")
+        except ValueError:
+            return None
+    return None
+
+
+def _stable_id(*parts: Any) -> str:
+    return "h-" + hashlib.md5("|".join(map(str, parts)).encode("utf-8")).hexdigest()[:24]
+
+
+def _norm_deepseek(messages: list[dict]) -> list[dict]:
+    out = []
+    for m in messages or []:
+        content = ""
+        thinking = ""
+        for f in m.get("fragments") or []:
+            ftype = f.get("type")
+            if ftype == "THINK":
+                thinking += (f.get("content") or "") + "\n"
+            elif ftype in ("RESPONSE", "TIP", "REQUEST"):
+                content += (f.get("content") or "") + "\n"
+        if not content.strip() and isinstance(m.get("content"), str):
+            content = m["content"]
+        role_map = {"USER": "user", "ASSISTANT": "assistant", "SYSTEM": "system"}
+        out.append({
+            "message_id": str(
+                m.get("message_id")
+                if m.get("message_id") is not None
+                else _stable_id("ds", m.get("inserted_at"), content[:80])
+            ),
+            "role": role_map.get(m.get("role"), "assistant"),
+            "content": content.strip() or None,
+            "thinking_content": thinking.strip() or None,
+            "msg_time": _to_dt(m.get("inserted_at")),
+        })
+    return out
+
+
+def _norm_ncn(messages: list[dict], conv_id: str) -> list[dict]:
+    out = []
+    for i, m in enumerate(messages or []):
+        if m.get("prompt") and str(m["prompt"]).strip():
+            out.append({
+                "message_id": f"{conv_id}-u{i}",
+                "role": "user",
+                "content": str(m["prompt"]).strip() or None,
+                "thinking_content": None,
+                "msg_time": None,
+            })
+        if m.get("result") and str(m["result"]).strip():
+            out.append({
+                "message_id": f"{conv_id}-a{i}",
+                "role": "assistant",
+                "content": str(m["result"]).strip() or None,
+                "thinking_content": None,
+                "msg_time": None,
+            })
+    return out
+
+
+def _yuanbao_blocks(blocks: list, acc: dict) -> None:
+    for b in blocks or []:
+        btype = b.get("type")
+        if btype == "text" and b.get("msg"):
+            acc["content"] += str(b["msg"]) + "\n\n"
+        elif btype == "think":
+            acc["thinking"] += (b.get("content") or "") + "\n"
+        elif not isinstance(b, dict):
+            continue
+
+
+def _norm_yuanbao(convs: list[dict], conv_id: str) -> list[dict]:
+    out = []
+    for i, turn in enumerate(sorted(convs or [], key=lambda t: t.get("index") or 0)):
+        acc = {"content": "", "thinking": ""}
+        if isinstance(turn.get("content"), list):
+            _yuanbao_blocks(turn["content"], acc)
+        if not acc["content"].strip() and turn.get("speechesV2"):
+            for sp in turn["speechesV2"]:
+                _yuanbao_blocks(sp.get("content"), acc)
+        if not acc["content"].strip() and isinstance(turn.get("content"), str):
+            acc["content"] = turn["content"]
+        if not acc["content"].strip() and isinstance(turn.get("displayPrompt"), str):
+            acc["content"] = turn["displayPrompt"]
+        out.append({
+            "message_id": str(
+                turn.get("msgId")
+                if turn.get("msgId") is not None
+                else f"{conv_id}-{turn.get('index') if turn.get('index') is not None else i}"
+            ),
+            "role": "user" if turn.get("speaker") == "human" else "assistant",
+            "content": acc["content"].strip() or None,
+            "thinking_content": acc["thinking"].strip() or None,
+            "msg_time": _to_dt(turn.get("createTime")),
+        })
+    return out
+
+
+def _norm_kimi(messages: list[dict]) -> list[dict]:
+    out = []
+    for m in messages or []:
+        if not isinstance(m, dict) or m.get("role") == "system" or not m.get("id"):
+            continue
+        content = ""
+        thinking = ""
+        for b in m.get("blocks") or []:
+            if isinstance(b, dict) and isinstance(b.get("text"), dict) and b["text"].get("content"):
+                content += str(b["text"]["content"]) + "\n"
+            elif isinstance(b, dict) and isinstance(b.get("think"), dict) and b["think"].get("content"):
+                thinking += str(b["think"]["content"]) + "\n"
+        out.append({
+            "message_id": str(m["id"]),
+            "role": "user" if m.get("role") == "user" else "assistant",
+            "content": content.strip() or None,
+            "thinking_content": thinking.strip() or None,
+            "msg_time": _to_dt(m.get("createTime")),
+        })
+    return out
+
+
+def _norm_qianwen(turns: list[dict], session_id: str) -> list[dict]:
+    def _key(t: dict):
+        pos = t.get("pos")
+        return float(pos) if pos is not None else float(t.get("request_timestamp") or 0)
+
+    out = []
+    for i, turn in enumerate(sorted(turns or [], key=_key)):
+        t = _to_dt(turn.get("pos") or turn.get("request_timestamp"))
+        base_id = str(
+            turn.get("req_id")
+            if turn.get("req_id") is not None
+            else f"{session_id}-t{i}"
+        )
+        texts = []
+        for m in turn.get("request_messages") or []:
+            if m.get("mime_type") == "text/plain" and m.get("content"):
+                texts.append(str(m["content"]))
+        if texts:
+            out.append({
+                "message_id": f"{base_id}-u",
+                "role": "user",
+                "content": "\n".join(texts) or None,
+                "thinking_content": None,
+                "msg_time": t,
+            })
+        answers = [
+            str(m["content"])
+            for m in turn.get("response_messages") or []
+            if m.get("mime_type") == "multi_load/iframe"
+            and m.get("content")
+            and str(m["content"]).strip()
+        ]
+        if answers:
+            out.append({
+                "message_id": f"{base_id}-a",
+                "role": "assistant",
+                "content": "\n\n".join(answers) or None,
+                "thinking_content": None,
+                "msg_time": t,
+            })
+    return out
+
+
+def _norm_iflytek(history_list: list[dict], chat_id: str) -> list[dict]:
+    out = []
+    for i, m in enumerate(history_list or []):
+        is_user = m.get("type") == 0
+        content = m.get("message") or ""
+        if not str(content).strip() and not is_user and m.get("jsonMessage"):
+            try:
+                content = json.loads(m["jsonMessage"]).get("text") or m["jsonMessage"]
+            except (ValueError, TypeError):
+                content = m["jsonMessage"]
+        out.append({
+            "message_id": str(
+                m.get("messageId")
+                if m.get("messageId") is not None
+                else (m.get("msgId") if m.get("msgId") is not None else f"{chat_id}-m{i}")
+            ),
+            "role": "user" if is_user else "assistant",
+            "content": str(content).strip() or None,
+            "thinking_content": None,
+            "msg_time": _to_dt(m.get("createTime")),
+        })
+    return out
+
+
+def _doubao_text(msg: dict) -> str:
+    content = ""
+
+    def push_block(item: dict) -> None:
+        nonlocal content
+        if not isinstance(item, dict):
+            return
+        if item.get("block_type") == 10000:
+            tb = (item.get("content") or {}).get("text_block") or {}
+            if tb.get("text"):
+                content += tb["text"] + "\n\n"
+
+    try:
+        if msg.get("content_type") == 1:
+            obj = msg.get("content") or {}
+            if isinstance(obj, str):
+                obj = json.loads(obj or "{}")
+            content = obj.get("text") or ""
+        elif msg.get("content_type") == 9999:
+            arr = msg.get("content") or []
+            if isinstance(arr, str):
+                arr = json.loads(arr or "[]")
+            if isinstance(arr, list):
+                for item in arr:
+                    push_block(item)
+            if not content.strip() and isinstance(msg.get("content_block"), list):
+                for item in msg["content_block"]:
+                    push_block(item)
+    except (ValueError, TypeError):
+        pass
+    return content
+
+
+def _norm_doubao(messages: list[dict]) -> list[dict]:
+    out = []
+    for m in sorted(messages or [], key=lambda x: x.get("create_time") or 0):
+        content = _doubao_text(m)
+        out.append({
+            "message_id": str(
+                m.get("message_id")
+                if m.get("message_id") is not None
+                else _stable_id("db", m.get("create_time"), content[:80])
+            ),
+            "role": "user" if m.get("user_type") == 1 else "assistant",
+            "content": content.strip() or None,
+            "thinking_content": m.get("thinking") if isinstance(m.get("thinking"), str) else None,
+            "msg_time": _to_dt(m.get("create_time")),
+        })
+    return out
+
+
+def _norm_tongyi(conv: dict, ctx: dict) -> list[dict]:
+    msgs = sorted(conv.get("data") or [], key=lambda m: m.get("createTime") or 0)
+    out = []
+    for i, m in enumerate(msgs):
+        texts = []
+        for c in m.get("contents") or []:
+            if c.get("contentType") == "text" and c.get("content"):
+                texts.append(str(c["content"]))
+        conv_id = str(ctx.get("conversation_id") or "") or _stable_id(
+            "tongyi", ctx.get("title") or "", str((msgs[0].get("contents") or [{}])[0].get("content") or "")[:100]
+        )
+        out.append({
+            "message_id": str(
+                m.get("messageId")
+                if m.get("messageId") is not None
+                else f"{conv_id}-m{i}"
+            ),
+            "role": "user" if m.get("senderType") == "USER" else "assistant",
+            "content": "\n".join(texts) or None,
+            "thinking_content": None,
+            "msg_time": _to_dt(m.get("createTime")),
+        })
+    return out
+
+
+def normalize_conversation(platform: str, conv: dict, ctx: dict | None = None) -> dict:
+    """平台原始会话数据 → 统一结构 {conversation_id, title, times, messages[]}。"""
+    ctx = ctx or {}
+    if not isinstance(conv, dict):
+        raise ValueError("conversation 数据无效")
+
+    if platform == "deepseek":
+        is_single = not conv.get("messages") and (conv.get("data") or {}).get("biz_data")
+        biz = (conv.get("data") or {}).get("biz_data") or {}
+        messages = biz.get("chat_messages") if is_single else conv.get("messages") or []
+        conversation_id = str(
+            (ctx.get("conversation_id") or "") if is_single else (conv.get("chat_session_id") or ctx.get("conversation_id") or "")
+        )
+        title = (
+            (biz.get("chat_session") or {}).get("title") or ctx.get("title")
+            if is_single
+            else conv.get("title") or ctx.get("title")
+        )
+        norm = _norm_deepseek(messages)
+        return {
+            "conversation_id": conversation_id or _stable_id("deepseek", title, str((norm[0] or {}).get("content") or "")[:100]),
+            "title": title or "DeepSeek对话",
+            "platform_created_at": None,
+            "platform_updated_at": _to_dt(None if is_single else conv.get("updated_at")),
+            "messages": norm,
+        }
+
+    if platform == "ncn":
+        meta = conv.get("data") or {}
+        messages = meta.get("messages") or []
+        title = meta.get("title") or ctx.get("title") or "纳米AI对话"
+        conversation_id = str(ctx.get("conversation_id") or "")
+        conv_id = conversation_id or _stable_id("ncn", title, str((messages[0] or {}).get("prompt") or "")[:100])
+        return {
+            "conversation_id": conv_id,
+            "title": title,
+            "platform_created_at": None,
+            "platform_updated_at": _to_dt(conv.get("timestamp")),
+            "messages": _norm_ncn(messages, conv_id),
+        }
+
+    if platform == "yuanbao":
+        has_batch_field = conv.get("conversation_id") is not None
+        convs = conv.get("convs") or []
+        title = conv.get("title") or conv.get("sessionTitle") or ctx.get("title") or "元宝对话"
+        conversation_id = str(conv.get("conversation_id") if has_batch_field else (ctx.get("conversation_id") or ""))
+        conv_id = conversation_id or _stable_id("yuanbao", title, str(((convs[0] or {}).get("content") or [{}])[0].get("msg") or (convs[0] or {}).get("displayPrompt") or "")[:100])
+        return {
+            "conversation_id": conv_id,
+            "title": title,
+            "platform_created_at": None,
+            "platform_updated_at": _to_dt(conv.get("last_replied_at")),
+            "messages": _norm_yuanbao(convs, conv_id),
+        }
+
+    if platform == "kimi":
+        messages = conv.get("messages") or []
+        conversation_id = str(conv.get("chat_id") or ctx.get("conversation_id") or "")
+        conv_id = conversation_id or _stable_id("kimi", ctx.get("title") or "", "")
+        return {
+            "conversation_id": conv_id,
+            "title": conv.get("title") or ctx.get("title") or "Kimi对话",
+            "platform_created_at": _to_dt(conv.get("create_time")),
+            "platform_updated_at": _to_dt(conv.get("update_time")),
+            "messages": _norm_kimi(messages),
+        }
+
+    if platform == "qianwen":
+        is_single = (conv.get("data") or {}).get("list") is not None
+        turns = (conv.get("data") or {}).get("list") if is_single else conv.get("turns") or []
+        conversation_id = str(
+            (ctx.get("conversation_id") or "") if is_single else (conv.get("session_id") or ctx.get("conversation_id") or "")
+        )
+        title = (ctx.get("title") or "通义千问对话") if is_single else (conv.get("title") or ctx.get("title"))
+        conv_id = conversation_id or _stable_id("qianwen", title, str(((turns[0] or {}).get("request_messages") or [{}])[0].get("content") or "")[:100])
+        return {
+            "conversation_id": conv_id,
+            "title": title or "通义千问对话",
+            "platform_created_at": _to_dt(None if is_single else conv.get("created_at")),
+            "platform_updated_at": _to_dt(None if is_single else conv.get("updated_at")),
+            "messages": _norm_qianwen(turns, conv_id),
+        }
+
+    if platform == "iflytek":
+        is_single = isinstance(conv.get("data"), list)
+        item = (conv.get("data") or [{}])[0] if is_single else conv
+        history_list = item.get("historyList") or []
+        conversation_id = str(item.get("chatId") or item.get("chat_id") or ctx.get("conversation_id") or "")
+        conv_id = conversation_id or _stable_id("iflytek", ctx.get("title") or "", str(next((m.get("message") for m in history_list if m.get("type") == 0), "") or "")[:100])
+        return {
+            "conversation_id": conv_id,
+            "title": item.get("title") or ctx.get("title") or "讯飞星火对话",
+            "platform_created_at": _to_dt(item.get("create_time")),
+            "platform_updated_at": _to_dt(item.get("update_time")),
+            "messages": _norm_iflytek(history_list, conv_id),
+        }
+
+    if platform == "doubao":
+        is_single = conv.get("downlink_body") is not None
+        if is_single:
+            messages = ((conv.get("downlink_body") or {}).get("pull_singe_chain_downlink_body") or {}).get("messages") or []
+        else:
+            messages = conv.get("messages") or []
+        conversation_id = str(
+            (ctx.get("conversation_id") or "") if is_single else (conv.get("conversation_id") or ctx.get("conversation_id") or "")
+        )
+        title = (ctx.get("title") or "豆包对话") if is_single else (conv.get("name") or conv.get("title") or ctx.get("title"))
+        conv_id = conversation_id or _stable_id("doubao", title, str((messages[0] or {}).get("content") or "")[:100])
+        return {
+            "conversation_id": conv_id,
+            "title": title or "豆包对话",
+            "platform_created_at": _to_dt(None if is_single else conv.get("create_time")),
+            "platform_updated_at": _to_dt(None if is_single else conv.get("update_time")),
+            "messages": _norm_doubao(messages),
+        }
+
+    if platform == "tongyi":
+        list_ = conv.get("data") or []
+        conv_id = str(ctx.get("conversation_id") or "") or _stable_id("tongyi", ctx.get("title") or "", str((list_[0].get("contents") or [{}])[0].get("content") or "")[:100] if list_ else "")
+        return {
+            "conversation_id": conv_id,
+            "title": ctx.get("title") or "通义千问对话",
+            "platform_created_at": None,
+            "platform_updated_at": None,
+            "messages": _norm_tongyi(conv, ctx),
+        }
+
+    raise ValueError(f"不支持的平台: {platform}")
+
+
+def _content_hash(messages: list[dict]) -> str:
+    h = hashlib.md5()
+    parts = [
+        "\x01".join([
+            str(m.get("message_id") or ""),
+            str(m.get("role") or ""),
+            str(m.get("content") or ""),
+            str(m.get("thinking_content") or ""),
+            str(m.get("msg_time") or ""),
+        ])
+        for m in messages
+    ]
+    h.update("\x02".join(parts).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _upsert_conversation(platform: str, n: dict) -> dict:
+    db = _get_db()
+    now = _now_iso()
+    char_count = sum(
+        len(m.get("content") or "") + len(m.get("thinking_content") or "") for m in n["messages"]
+    )
+    times = [m["msg_time"] for m in n["messages"] if m.get("msg_time")]
+    first = min(times) if times else None
+    last = max(times) if times else None
+    chash = _content_hash(n["messages"])
+
+    with _DB_LOCK, db:
+        existing = db.execute(
+            "SELECT id, content_hash FROM conversations WHERE platform_code=? AND conversation_id=?",
+            (platform, n["conversation_id"]),
+        ).fetchone()
+        if existing and existing["content_hash"] and existing["content_hash"] == chash:
+            db.execute(
+                "UPDATE conversations SET received_at=? WHERE id=?", (now, existing["id"])
+            )
+            return {"skipped": True, "conversation_id": n["conversation_id"], "message_count": len(n["messages"])}
+
+        db.execute(
+            """INSERT INTO conversations
+                 (platform_code, conversation_id, title, message_count, char_count,
+                  first_message_at, last_message_at, platform_created_at, platform_updated_at,
+                  content_hash, received_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(platform_code, conversation_id) DO UPDATE SET
+                 title=excluded.title, message_count=excluded.message_count,
+                 char_count=excluded.char_count, first_message_at=excluded.first_message_at,
+                 last_message_at=excluded.last_message_at, platform_created_at=excluded.platform_created_at,
+                 platform_updated_at=excluded.platform_updated_at, content_hash=excluded.content_hash,
+                 received_at=excluded.received_at""",
+            (
+                platform, n["conversation_id"], (n.get("title") or "")[:512] or None,
+                len(n["messages"]), char_count, first, last,
+                n.get("platform_created_at"), n.get("platform_updated_at"), chash, now,
+            ),
+        )
+        row = db.execute(
+            "SELECT id FROM conversations WHERE platform_code=? AND conversation_id=?",
+            (platform, n["conversation_id"]),
+        ).fetchone()
+        conv_row_id = row["id"]
+        db.execute("DELETE FROM messages WHERE conversation_row_id=?", (conv_row_id,))
+        db.executemany(
+            """INSERT OR IGNORE INTO messages
+                 (conversation_row_id, platform_code, message_id, role, seq, content, thinking_content, msg_time)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            [
+                (conv_row_id, platform, m.get("message_id"), m.get("role"), i,
+                 m.get("content"), m.get("thinking_content"), m.get("msg_time"))
+                for i, m in enumerate(n["messages"])
+            ],
+        )
+    return {
+        "conversation_id": n["conversation_id"],
+        "title": n.get("title"),
+        "message_count": len(n["messages"]),
+        "char_count": char_count,
+    }
+
+
+# ---------------- 上传 API（扩展协议兼容） ----------------
+
+def _check_token(request: Request, payload: dict) -> None:
+    token = request.headers.get("x-upload-token") or payload.get("token")
+    if token != UPLOAD_TOKEN:
+        raise HTTPException(401, "token 无效")
+
+
+upload_router = APIRouter()
+
+
+def _upload_json(content: dict, status_code: int = 200) -> JSONResponse:
+    return JSONResponse(
+        content,
+        status_code=status_code,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Content-Type, X-Upload-Token",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        },
+    )
+
+
+@upload_router.options("/upload")
+@upload_router.options("/check")
+@upload_router.options("/batch-log")
+async def _upload_preflight():
+    return _upload_json({"ok": True})
+
+
+@upload_router.get("/upload/health")
+async def upload_health():
+    return _upload_json({"ok": True, "time": _now_iso()})
+
+
+@upload_router.post("/upload")
+async def upload_conversation(request: Request):
+    payload = await request.json()
+    _check_token(request, payload)
+    platform = re.sub(r"_(title|chat)$", "", str(payload.get("platform") or ""))
+    if not platform:
+        return _upload_json({"ok": False, "error": "缺少 platform"}, 400)
+    try:
+        n = normalize_conversation(
+            platform,
+            payload.get("conversation"),
+            {"conversation_id": payload.get("conversation_id"), "title": payload.get("title")},
+        )
+    except Exception as e:  # noqa: BLE001 - 与原服务一致，归一化错误原样返回
+        return _upload_json({"ok": False, "error": f"归一化失败: {e}"}, 400)
+    if not n["messages"]:
+        return _upload_json({"ok": False, "error": "会话无消息"}, 400)
+    try:
+        result = _upsert_conversation(platform, n)
+        refresh_manifest()
+    except Exception:
+        logger.exception("[browser_history] /upload 入库失败 platform=%s", platform)
+        return _upload_json({"ok": False, "error": "入库失败"}, 500)
+    return _upload_json({"ok": True, **result})
+
+
+@upload_router.post("/check")
+async def check_conversations(request: Request):
+    payload = await request.json()
+    _check_token(request, payload)
+    platform = re.sub(r"_(title|chat)$", "", str(payload.get("platform") or ""))
+    items = payload.get("items") or []
+    if not platform or not items:
+        return _upload_json({"ok": False, "error": "参数缺失"}, 400)
+    ids = {str(it.get("conversation_id") or "").strip() for it in items if str(it.get("conversation_id") or "").strip()}
+    db = _get_db()
+    with _DB_LOCK:
+        db_map = {}
+        if ids:
+            rows = db.execute(
+                "SELECT conversation_id, platform_updated_at, last_message_at, message_count"
+                " FROM conversations WHERE platform_code=?"
+                f" AND conversation_id IN ({','.join('?' * len(ids))})",
+                [platform, *ids],
+            ).fetchall()
+            db_map = {r["conversation_id"]: r for r in rows}
+    need_upload = []
+    skipped = 0
+    for it in items:
+        cid = str(it.get("conversation_id") or "").strip()
+        db_row = db_map.get(cid) if cid else None
+        if not db_row:
+            need_upload.append(cid or None)
+            continue
+        item_time = _to_dt(it.get("updated"))
+        db_time = db_row["platform_updated_at"] or db_row["last_message_at"]
+        not_newer = bool(item_time and db_time and item_time <= db_time)
+        not_more = (not it.get("count")) or int(it.get("count") or 0) <= int(db_row["message_count"] or 0)
+        if not_newer and not_more:
+            skipped += 1
+        else:
+            need_upload.append(cid)
+    return _upload_json({"ok": True, "need_upload": need_upload, "skipped_count": skipped})
+
+
+@upload_router.post("/batch-log")
+async def upload_batch_log(request: Request):
+    payload = await request.json()
+    _check_token(request, payload)
+    db = _get_db()
+    with _DB_LOCK, db:
+        db.execute(
+            """INSERT INTO export_batches
+                 (batch_no, platform_code, batch_type, conversation_count, message_count,
+                  total_chars, failed_count, client_version, exported_at)
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(batch_no) DO UPDATE SET
+                 conversation_count=excluded.conversation_count,
+                 message_count=excluded.message_count,
+                 total_chars=excluded.total_chars, failed_count=excluded.failed_count""",
+            (
+                payload.get("batch_no"), payload.get("platform"), payload.get("batch_type") or "single",
+                payload.get("conversation_count") or 0, payload.get("message_count") or 0,
+                payload.get("total_chars") or 0, payload.get("failed_count") or 0,
+                payload.get("client_version"), _to_dt(payload.get("exported_at")) or _now_iso(),
+            ),
+        )
+    return _upload_json({"ok": True})
+
+
+# ---------------- 统计与状态 ----------------
+
+def _build_summary() -> dict[str, Any]:
+    db = _get_db()
+    with _DB_LOCK:
+        rows = db.execute(
+            "SELECT platform_code, COUNT(*) AS convs, COALESCE(SUM(message_count),0) AS msgs,"
+            " MAX(received_at) AS last_at FROM conversations GROUP BY platform_code"
+        ).fetchall()
+        total = db.execute(
+            "SELECT COUNT(*) AS convs, COALESCE(SUM(message_count),0) AS msgs,"
+            " MAX(received_at) AS last_at FROM conversations"
+        ).fetchone()
+    stats = {r["platform_code"]: r for r in rows}
+    platforms = []
+    for meta in PLATFORMS:
+        s = stats.get(meta["code"])
+        if not s:
+            continue
+        platforms.append({
+            "code": meta["code"],
+            "name": meta["name"],
+            "url": meta["url"],
+            "conversations": s["convs"],
+            "messages": s["msgs"],
+            "last_received_at": s["last_at"],
+        })
+    return {
+        "platforms": platforms,
+        "total_conversations": total["convs"],
+        "total_messages": total["msgs"],
+        "last_uploaded_at": total["last_at"],
+        "db_path": str(_db_path()),
+    }
+
+
+def refresh_manifest() -> None:
+    from .context_registry import write_manifest
+
+    write_manifest("browser_history", summary=_build_summary(), data_ref=str(_db_path()))
+
+
+# ---------------- 扩展副本管理 ----------------
+
+def extension_copy_dir() -> Path:
+    return _browser_history_root() / "extension"
+
+
+def ensure_extension_copy() -> dict[str, Any]:
+    """把 vendor 扩展复制到数据目录并 patch（上传地址指向本机后端）。幂等。"""
+    if not _VENDOR_DIR.is_dir():
+        raise HTTPException(500, f"扩展源目录缺失：{_VENDOR_DIR}")
+    dst = extension_copy_dir()
+    dst.mkdir(parents=True, exist_ok=True)
+    for name in ("manifest.json", "background.js", "bridge.js", "content.js", "popup.html", "popup.js"):
+        shutil.copy2(_VENDOR_DIR / name, dst / name)
+    (dst / "icons").mkdir(exist_ok=True)
+    for icon in ("icon16.png", "icon48.png", "icon128.png"):
+        shutil.copy2(_VENDOR_DIR / "icons" / icon, dst / "icons" / icon)
+
+    # patch manifest：host_permissions 增加本机后端，允许扩展后台跨域上传
+    manifest = json.loads((dst / "manifest.json").read_text(encoding="utf-8"))
+    hosts = manifest.setdefault("host_permissions", [])
+    if f"http://127.0.0.1/*" not in hosts and f"http://localhost/*" not in hosts:
+        hosts.append("http://127.0.0.1/*")
+        hosts.append("http://localhost/*")
+    (dst / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=4), encoding="utf-8"
+    )
+
+    # patch content.js：上传服务地址指向本机
+    content = (dst / "content.js").read_text(encoding="utf-8")
+    content = re.sub(
+        r"UPLOAD_SERVER:\s*\{[^}]*\}",
+        f"UPLOAD_SERVER: {{\n            url: '{UPLOAD_BASE_URL}',\n            token: '{UPLOAD_TOKEN}'\n        }}",
+        content,
+        count=1,
+    )
+    (dst / "content.js").write_text(content, encoding="utf-8")
+    logger.info("[browser_history] 扩展副本已生成 dir=%s upload_url=%s", dst, UPLOAD_BASE_URL)
+    return {"extension_dir": str(dst), "upload_url": UPLOAD_BASE_URL}
+
+
+# ---------------- 安装检测 ----------------
+
+def _browser_profile_dirs() -> list[tuple[str, Path]]:
+    out: list[tuple[str, Path]] = []
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        return out
+    for browser, rel in (
+        ("Chrome", Path(local) / "Google" / "Chrome" / "User Data"),
+        ("Edge", Path(local) / "Microsoft" / "Edge" / "User Data"),
+    ):
+        user_data = rel
+        if not user_data.is_dir():
+            continue
+        for profile in user_data.iterdir():
+            if profile.name in ("Default",) or profile.name.startswith("Profile "):
+                if (profile / "Preferences").exists() or (profile / "Secure Preferences").exists():
+                    out.append((browser, profile))
+    return out
+
+
+def detect_extension_install() -> dict[str, Any]:
+    """扫描 Chrome/Edge 各 profile 的扩展配置，按扩展名匹配安装状态。"""
+    found: list[dict[str, str]] = []
+    for browser, profile in _browser_profile_dirs():
+        for pref_name in ("Preferences", "Secure Preferences"):
+            pref = profile / pref_name
+            try:
+                data = json.loads(pref.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            settings = ((data.get("extensions") or {}).get("settings") or {})
+            for ext_id, ext in settings.items():
+                if not isinstance(ext, dict):
+                    continue
+                name = str(((ext.get("manifest") or {}).get("name")) or "")
+                path = str(ext.get("path") or "")
+                if EXTENSION_NAME in name or "browser_history" in path.replace("/", "\\"):
+                    found.append({
+                        "browser": browser,
+                        "profile": profile.name,
+                        "extension_id": str(ext_id),
+                        "name": name or EXTENSION_NAME,
+                        "path": path,
+                    })
+    return {
+        "installed": bool(found),
+        "installations": found,
+        "extension_name": EXTENSION_NAME,
+        "extension_dir": str(extension_copy_dir()) if extension_copy_dir().exists() else None,
+    }
+
+
+_EXTENSION_PAGE_URLS = {"chrome": "chrome://extensions/", "edge": "edge://extensions/"}
+
+
+def _winreg_value(root, subkey: str, name: str = "") -> Optional[str]:
+    """读注册表字符串值，失败返回 None（winreg 仅 Windows 存在）。"""
+    try:
+        import winreg
+    except ImportError:
+        return None
+    try:
+        with winreg.OpenKey(root, subkey) as key:
+            value, _ = winreg.QueryValueEx(key, name)
+            return str(value)
+    except OSError:
+        return None
+
+
+def _exe_from_command(command: str) -> str:
+    """从注册表的 'C:\\...\\chrome.exe" --single-argument' 提取可执行文件路径。"""
+    command = (command or "").strip()
+    if not command:
+        return ""
+    if command.startswith('"'):
+        end = command.find('"', 1)
+        return command[1:end].strip() if end > 0 else ""
+    return command.split(" ", 1)[0].strip()
+
+
+def _candidate_browser_exes(kind: str) -> list[str]:
+    """多渠道定位浏览器可执行文件，覆盖不同电脑的自定义安装位置。
+
+    依次尝试：注册表 App Paths、默认浏览器 ProgID、PATH、常见安装目录。
+    """
+    try:
+        import winreg
+    except ImportError:
+        winreg = None  # type: ignore[assignment]
+
+    exes: list[str] = []
+    if winreg is not None:
+        # 1) 注册表 App Paths（Chrome/Edge 安装时注册，任意安装位置都能查到）
+        app_paths = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{kind}.exe"
+        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            for subkey in (app_paths, "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\App Paths\\" + f"{kind}.exe"):
+                value = _winreg_value(root, subkey)
+                if value:
+                    exes.append(value)
+                    # 有的机器默认值只写目录，不写完整 exe 路径
+                    if not value.lower().endswith(".exe"):
+                        exes.append(str(Path(value) / f"{kind}.exe"))
+        # 2) 默认浏览器 ProgID（默认浏览器恰好是目标浏览器时命中）
+        prog_id = _winreg_value(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice",
+            "ProgID",
+        )
+        if prog_id:
+            exe = _exe_from_command(
+                _winreg_value(winreg.HKEY_CLASSES_ROOT, rf"{prog_id}\shell\open\command")
+            )
+            if exe and Path(exe).name.lower() == f"{kind}.exe":
+                exes.append(exe)
+    # 3) PATH 环境变量中的可执行文件
+    found = shutil.which(kind)
+    if found:
+        exes.append(found)
+    # 4) 常见安装目录
+    if kind == "chrome":
+        exes += [
+            os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        ]
+    else:
+        exes += [
+            os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+            os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
+        ]
+    # 去重、仅保留真实存在的文件
+    seen: set[str] = set()
+    result: list[str] = []
+    for exe in exes:
+        if not exe:
+            continue
+        key = os.path.normcase(os.path.normpath(exe))
+        if key in seen:
+            continue
+        seen.add(key)
+        if Path(exe).is_file():
+            result.append(exe)
+    return result
+
+
+def open_extensions_page(browser: str = "chrome") -> dict[str, Any]:
+    """直接用浏览器可执行文件打开扩展管理页，不弹系统「选择应用」对话框。
+
+    chrome.exe 带上 chrome://extensions/ 参数启动：浏览器已打开则直接在现有窗口
+    新开标签页，未打开则自动启动浏览器。Chrome 找不到时自动降级 Edge。
+    """
+    import subprocess
+
+    order = ["edge"] if browser == "edge" else ["chrome", "edge"]
+    for kind in order:
+        for exe in _candidate_browser_exes(kind):
+            url = _EXTENSION_PAGE_URLS[kind]
+            try:
+                subprocess.Popen([exe, url], close_fds=True)
+            except OSError:
+                logger.warning("browser_history open-page launch failed: %s", exe)
+                continue
+            return {"ok": True, "browser": kind, "url": url}
+    return {
+        "ok": False,
+        "error": "未找到 Chrome/Edge 浏览器，请手动打开浏览器，在地址栏输入 chrome://extensions/ 进入扩展管理页",
+    }
+
+
+def open_platform_url(url: str) -> dict[str, Any]:
+    import webbrowser
+
+    webbrowser.open(url)
+    return {"ok": True, "url": url}
+
+
+# ---------------- ContextSource 实现 ----------------
+
+class BrowserHistorySource:
+    """浏览器记录上下文源：接收扩展上传的 GPT 平台会话数据，提供统计状态。"""
+
+    planned = False
+    source_id = "browser_history"
+    display_name = "浏览器记录"
+
+    def status(self) -> dict[str, Any]:
+        from .context_registry import load_settings, read_manifest
+
+        settings = load_settings()
+        manifest = read_manifest("browser_history")
+        install = detect_extension_install()
+        summary = _build_summary()
+        state = "up_to_date" if summary["total_conversations"] else "idle"
+        return {
+            "source_id": self.source_id,
+            "name": self.display_name,
+            "enabled": bool(settings.get("browser_history", {}).get("enabled", True)),
+            "state": state,
+            "last_saved_at": manifest.get("last_saved_at") or summary.get("last_uploaded_at"),
+            "summary": {**summary, "extension": install},
+            "planned": False,
+        }
+
+    def start(self) -> None:
+        pass  # 被动接收：上传端点常驻，无后台任务
+
+    def stop(self) -> None:
+        pass
+
+
+BROWSER_HISTORY_SOURCE = BrowserHistorySource()
+
+
+# ---------------- 管理端点（本地前端调用） ----------------
+
+def _local_only(request: Request):
+    try:
+        if not ipaddress.ip_address(request.client.host).is_loopback:
+            raise ValueError()
+        host = request.url.hostname
+        if host not in {"localhost", "127.0.0.1", "::1"}:
+            raise ValueError()
+    except (ValueError, AttributeError):
+        raise HTTPException(403, "上下文服务仅允许本机应用访问") from None
+
+
+manage_router = APIRouter(
+    prefix="/api/context/browser-history", dependencies=[Depends(_local_only)]
+)
+
+
+@manage_router.get("/status", summary="扩展安装状态与平台统计")
+async def browser_history_status():
+    return {"status": "ok", **detect_extension_install(), "summary": _build_summary()}
+
+
+@manage_router.post("/extension/prepare", summary="生成/更新扩展副本（已指向本机后端）")
+async def prepare_extension():
+    result = await _run(ensure_extension_copy)
+    refresh_manifest()
+    return {"status": "ok", **result}
+
+
+@manage_router.post("/extension/open-page", summary="打开浏览器扩展管理页")
+async def open_extensions_page_endpoint(payload: dict):
+    browser = str(payload.get("browser") or "chrome")
+    return {"status": "ok", **await _run(open_extensions_page, browser)}
+
+
+@manage_router.post("/open-platform", summary="打开 GPT 平台网站")
+async def open_platform_endpoint(payload: dict):
+    url = str(payload.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(400, "无效的平台地址")
+    return {"status": "ok", **await _run(open_platform_url, url)}
+
+
+async def _run(func, *args):
+    import asyncio
+
+    return await asyncio.to_thread(func, *args)

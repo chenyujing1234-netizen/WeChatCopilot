@@ -36,7 +36,10 @@ def test_sources_lists_all_five(client):
         "custom_capture",
     }
     planned = {s["source_id"] for s in body["sources"] if s["planned"]}
-    assert planned == {"browser_history", "computer_activity", "mobile_upload", "custom_capture"}
+    assert planned == {"computer_activity", "mobile_upload", "custom_capture"}
+    browser = [s for s in body["sources"] if s["source_id"] == "browser_history"][0]
+    assert browser["planned"] is False
+    assert browser["name"] == "浏览器记录"
 
 
 def test_settings_roundtrip(client):

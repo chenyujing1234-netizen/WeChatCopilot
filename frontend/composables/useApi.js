@@ -1244,12 +1244,39 @@ export const useApi = () => {
     })
   }
 
+  // 浏览器记录：扩展安装状态 / 生成扩展副本 / 打开扩展管理页 / 打开 GPT 平台
+  const getBrowserHistoryStatus = async () => {
+    return await request('/context/browser-history/status')
+  }
+
+  const prepareBrowserExtension = async () => {
+    return await request('/context/browser-history/extension/prepare', { method: 'POST' })
+  }
+
+  const openBrowserExtensionPage = async (browser = 'chrome') => {
+    return await request('/context/browser-history/extension/open-page', {
+      method: 'POST',
+      body: { browser }
+    })
+  }
+
+  const openGptPlatform = async (url) => {
+    return await request('/context/browser-history/open-platform', {
+      method: 'POST',
+      body: { url }
+    })
+  }
+
   return {
     pickSystemDirectory,
     getContextSources,
     getContextSettings,
     updateContextSettings,
     triggerWechatSync,
+    getBrowserHistoryStatus,
+    prepareBrowserExtension,
+    openBrowserExtensionPage,
+    openGptPlatform,
     getImgHelperStatus,
     toggleImgHelper,
     getCdnImageStatus,

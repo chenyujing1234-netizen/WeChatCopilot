@@ -24,7 +24,7 @@ def test_list_sources_registers_five_sources():
 
 def test_stub_sources_report_planned_and_create_dirs(tmp_path):
     cr.list_sources()
-    for sid in ("browser_history", "computer_activity", "mobile_upload", "custom_capture"):
+    for sid in ("computer_activity", "mobile_upload", "custom_capture"):
         status = cr.SOURCES[sid].status()
         assert status["planned"] is True
         assert status["state"] == "planned"
@@ -32,9 +32,16 @@ def test_stub_sources_report_planned_and_create_dirs(tmp_path):
         assert (tmp_path / "contexts" / sid).is_dir()
 
 
+def test_browser_history_is_real_source(tmp_path):
+    status = cr.SOURCES["browser_history"].status()
+    assert status["planned"] is False
+    assert status["name"] == "浏览器记录"
+    assert status["state"] in {"idle", "up_to_date"}
+    assert "platforms" in status["summary"]
+    assert "extension" in status["summary"]
+
+
 def test_stub_sources_carry_config_placeholders():
-    browser = cr.SOURCES["browser_history"].status()
-    assert browser["summary"]["plugin"] == {"install": "planned", "update": "planned"}
     mobile = cr.SOURCES["mobile_upload"].status()
     assert mobile["summary"]["nextcloud"] == {"server_url": "", "configured": False}
 
@@ -49,7 +56,7 @@ def test_wechat_source_defaults():
 def test_settings_roundtrip(tmp_path):
     settings = cr.load_settings()
     assert settings["wechat"]["enabled"] is True
-    assert settings["browser_history"]["enabled"] is False
+    assert settings["browser_history"]["enabled"] is True
 
     saved = cr.save_settings({"wechat": {"enabled": False}})
     assert saved["wechat"]["enabled"] is False
