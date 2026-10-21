@@ -8,3 +8,6 @@ if not exist "%PY%" set "PY=python"
 "%PY%" "%TOOL_DIR%chat_sorter_gui.py" %*
 if errorlevel 1 pause
 endlocal
+
+
+
