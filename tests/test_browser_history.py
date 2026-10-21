@@ -209,6 +209,76 @@ def test_manage_status_endpoint(client):
     assert body["summary"]["total_conversations"] == 1
 
 
+def test_detect_extension_by_store_id_in_preferences(tmp_path, monkeypatch):
+    """商店正式版固定 ID 出现在扩展配置中即视为已安装（即便 manifest 名称为空）。"""
+    import json as _json
+
+    profile = tmp_path / "Default"
+    profile.mkdir()
+    (profile / "Preferences").write_text(
+        _json.dumps({"extensions": {"settings": {bh.STORE_EXTENSION_ID: {"path": r"C:\Chrome\Extensions", "manifest": {}}}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bh, "_browser_profile_dirs", lambda: [("Chrome", profile)])
+
+    result = bh.detect_extension_install()
+
+    assert result["installed"] is True
+    assert result["installations"][0]["extension_id"] == bh.STORE_EXTENSION_ID
+    assert result["installations"][0]["name"] == bh.EXTENSION_NAME
+
+
+def test_detect_extension_by_store_directory(tmp_path, monkeypatch):
+    """Preferences 无法解析时，Extensions/<商店版ID>/ 目录存在也能检出（文件系统兜底途径）。"""
+    profile = tmp_path / "Default"
+    profile.mkdir()
+    version_dir = profile / "Extensions" / bh.STORE_EXTENSION_ID / "2026.10.21_0"
+    version_dir.mkdir(parents=True)
+    (version_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(bh, "_browser_profile_dirs", lambda: [("Chrome", profile)])
+
+    result = bh.detect_extension_install()
+
+    assert result["installed"] is True
+    inst = result["installations"][0]
+    assert inst["browser"] == "Chrome"
+    assert inst["extension_id"] == bh.STORE_EXTENSION_ID
+    assert "Extensions" in inst["path"]
+
+
+def test_detect_extension_by_name_keeps_working(tmp_path, monkeypatch):
+    """本地加载副本仍按名称匹配（原有行为不回归）。"""
+    import json as _json
+
+    profile = tmp_path / "Default"
+    profile.mkdir()
+    (profile / "Preferences").write_text(
+        _json.dumps({"extensions": {"settings": {
+            "abcdefg": {"path": r"D:\data\browser_history\extension", "manifest": {"name": "AI对话导出 word/json/md"}}
+        }}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bh, "_browser_profile_dirs", lambda: [("Chrome", profile)])
+
+    result = bh.detect_extension_install()
+
+    assert result["installed"] is True
+    assert result["installations"][0]["extension_id"] == "abcdefg"
+
+
+def test_detect_extension_no_match(tmp_path, monkeypatch):
+    """无扩展时返回未安装。"""
+    profile = tmp_path / "Default"
+    profile.mkdir()
+    (profile / "Preferences").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(bh, "_browser_profile_dirs", lambda: [("Chrome", profile)])
+
+    result = bh.detect_extension_install()
+
+    assert result["installed"] is False
+    assert result["installations"] == []
+
+
 def test_prepare_extension_creates_patched_copy(client, tmp_path):
     vendor = Path(bh.__file__).parent / "browser_extension_src"
     if not vendor.is_dir():

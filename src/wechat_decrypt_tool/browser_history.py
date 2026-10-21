@@ -847,6 +847,11 @@ def ensure_extension_copy() -> dict[str, Any]:
 
 # ---------------- 安装检测 ----------------
 
+# 商店正式版「AI对话导出 word/json/md」的固定扩展 ID（Chrome Web Store 安装版，
+# 版本描述：支持 DeepSeek、纳米AI、腾讯元宝、Kimi、通义千问、讯飞星火、豆包）
+STORE_EXTENSION_ID = "cjdpniadfgdaekgbcdfbkoiilhmcdkge"
+
+
 def _browser_profile_dirs() -> list[tuple[str, Path]]:
     out: list[tuple[str, Path]] = []
     local = os.environ.get("LOCALAPPDATA")
@@ -867,8 +872,28 @@ def _browser_profile_dirs() -> list[tuple[str, Path]]:
 
 
 def detect_extension_install() -> dict[str, Any]:
-    """扫描 Chrome/Edge 各 profile 的扩展配置，按扩展名匹配安装状态。"""
+    """扫描 Chrome/Edge 各 profile 检测扩展安装状态（三种途径任一命中即已安装）。
+
+    1. Preferences/Secure Preferences 中扩展名称包含「AI对话导出 word/json/md」（本地加载副本）
+    2. 扩展配置中存在商店正式版的固定 ID（cjdpniadfgdaekgbcdfbkoiilhmcdkge）
+    3. profile 的 Extensions/<商店版固定ID>/ 目录存在（商店安装的落盘位置，不依赖 Preferences 解析）
+    """
     found: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add(browser: str, profile_name: str, ext_id: str, name: str, path: str) -> None:
+        key = (browser, profile_name, ext_id or name)
+        if key in seen:
+            return
+        seen.add(key)
+        found.append({
+            "browser": browser,
+            "profile": profile_name,
+            "extension_id": str(ext_id),
+            "name": name or EXTENSION_NAME,
+            "path": path,
+        })
+
     for browser, profile in _browser_profile_dirs():
         for pref_name in ("Preferences", "Secure Preferences"):
             pref = profile / pref_name
@@ -882,14 +907,18 @@ def detect_extension_install() -> dict[str, Any]:
                     continue
                 name = str(((ext.get("manifest") or {}).get("name")) or "")
                 path = str(ext.get("path") or "")
-                if EXTENSION_NAME in name or "browser_history" in path.replace("/", "\\"):
-                    found.append({
-                        "browser": browser,
-                        "profile": profile.name,
-                        "extension_id": str(ext_id),
-                        "name": name or EXTENSION_NAME,
-                        "path": path,
-                    })
+                if (
+                    EXTENSION_NAME in name
+                    or "browser_history" in path.replace("/", "\\")
+                    or str(ext_id) == STORE_EXTENSION_ID
+                ):
+                    add(browser, profile.name, str(ext_id), name, path)
+
+        # 文件系统途径：商店版扩展的安装目录存在（Preferences 结构变化时兜底）
+        store_dir = profile / "Extensions" / STORE_EXTENSION_ID
+        if store_dir.is_dir():
+            add(browser, profile.name, STORE_EXTENSION_ID, EXTENSION_NAME, str(store_dir))
+
     return {
         "installed": bool(found),
         "installations": found,
