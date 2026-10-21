@@ -1,6 +1,6 @@
 """微信上下文自动保存服务。
 
-后台常驻线程（模式参考 CHAT_REALTIME_AUTOSYNC），约 30s 一轮：
+后台常驻线程（模式参考 CHAT_REALTIME_AUTOSYNC），约 1h 一轮：
 1. 进程扫描（复用 wechat_detection）
 2. 检测当前登录账号 → 解析 db_storage 路径
 3. 凭据就绪（key store 或重新采集）→ 落盘 output/databases/<wxid>
@@ -39,7 +39,8 @@ from .wechat_detection import (
 
 logger = get_logger(__name__)
 
-_INTERVAL_SECONDS = 30.0
+# 自动保存轮询间隔：每 1 小时起一轮全量保存；数据新鲜度由实时同步（1s 粒度）保障
+_INTERVAL_SECONDS = 3600.0
 _STORED_KEY_FAILURE_LIMIT = 2
 # 手动保存等待在途轮的上限：一轮含等待实时同步与保存，可能耗时一两分钟
 _SYNC_NOW_WAIT_SECONDS = 300.0
@@ -159,7 +160,7 @@ class WechatAutosaveService:
     def sync_now(self) -> dict[str, Any]:
         """手动触发一轮保存；等待在途轮完成后执行，近期已成功则直接复用结果。
 
-        后台 tick 几乎持续保存（每 30s 起一轮、每轮耗时约一两分钟），
+        后台 tick 每小时起一轮、每轮耗时约一两分钟（期间由实时同步保持新鲜），
         立即报"忙"会让用户误以为保存失败，因此这里等待在途轮结束再返回。
         """
         if not self._sync_lock.acquire(timeout=_SYNC_NOW_WAIT_SECONDS):
