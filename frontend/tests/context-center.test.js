@@ -10,7 +10,10 @@ const api = {
   getBrowserHistoryStatus: vi.fn(),
   prepareBrowserExtension: vi.fn(),
   openBrowserExtensionPage: vi.fn(),
-  openGptPlatform: vi.fn()
+  openGptPlatform: vi.fn(),
+  getBrowserConversations: vi.fn(),
+  getBrowserConversation: vi.fn(),
+  downloadBrowserExport: vi.fn()
 }
 let wrapper
 let navigateToMock
@@ -38,6 +41,9 @@ beforeEach(() => {
   api.prepareBrowserExtension.mockReset().mockResolvedValue({ status: 'ok', extension_dir: 'C:\\data\\browser_history\\extension', upload_url: 'http://127.0.0.1:10392' })
   api.openBrowserExtensionPage.mockReset().mockResolvedValue({ status: 'ok' })
   api.openGptPlatform.mockReset().mockResolvedValue({ status: 'ok' })
+  api.getBrowserConversations.mockReset().mockResolvedValue({ total: 0, conversations: [] })
+  api.getBrowserConversation.mockReset().mockResolvedValue({ id: 0, messages: [] })
+  api.downloadBrowserExport.mockReset().mockResolvedValue('export.md')
 })
 
 afterEach(() => { wrapper?.unmount(); vi.unstubAllGlobals() })
@@ -134,6 +140,88 @@ describe('上下文中心首页', () => {
     await card.trigger('click')
     await flushPromises()
     expect(api.openGptPlatform).toHaveBeenCalledWith('https://chat.deepseek.com/')
+  })
+
+  it('切换到浏览器记录后加载并展示已同步会话列表', async () => {
+    api.getBrowserConversations.mockReset().mockResolvedValue({
+      total: 2,
+      conversations: [
+        { id: 1, platform_code: 'deepseek', platform_name: 'DeepSeek', title: '第一个会话', message_count: 4, char_count: 100, received_at: '2026-10-20T10:00:00' },
+        { id: 2, platform_code: 'kimi', platform_name: 'Kimi', title: '第二个会话', message_count: 6, char_count: 200, received_at: '2026-10-21T09:00:00' }
+      ]
+    })
+    const w = await mountHome()
+    await w.findAll('button').find(b => b.text() === '浏览器记录').trigger('click')
+    await flushPromises()
+    expect(api.getBrowserConversations).toHaveBeenCalled()
+    expect(w.text()).toContain('已同步会话')
+    expect(w.text()).toContain('第一个会话')
+    expect(w.text()).toContain('第二个会话')
+    expect(w.text()).toContain('下载全部（zip）')
+    expect(w.text()).toContain('下载 .md')
+  })
+
+  it('点击会话行展开显示消息明细，再点收起', async () => {
+    api.getBrowserConversations.mockReset().mockResolvedValue({
+      total: 1,
+      conversations: [{ id: 7, platform_code: 'deepseek', platform_name: 'DeepSeek', title: '展开会话', message_count: 2, char_count: 10, received_at: '2026-10-21T09:00:00' }]
+    })
+    api.getBrowserConversation.mockReset().mockResolvedValue({
+      id: 7,
+      title: '展开会话',
+      messages: [
+        { role: 'user', content: '用户的问题', msg_time: '2026-10-20T10:00:00', thinking_content: null },
+        { role: 'assistant', content: 'AI 的回答', msg_time: '2026-10-20T10:00:05', thinking_content: '推理过程' }
+      ]
+    })
+    const w = await mountHome()
+    await w.findAll('button').find(b => b.text() === '浏览器记录').trigger('click')
+    await flushPromises()
+    const row = w.findAll('div.cursor-pointer').find(el => el.text().includes('展开会话'))
+    await row.trigger('click')
+    await flushPromises()
+    expect(api.getBrowserConversation).toHaveBeenCalledWith(7)
+    expect(w.text()).toContain('用户的问题')
+    expect(w.text()).toContain('AI 的回答')
+    expect(w.text()).toContain('思考过程')
+    await row.trigger('click')
+    await flushPromises()
+    expect(w.text()).not.toContain('AI 的回答')
+  })
+
+  it('下载单会话与下载全部分别调用导出接口并提示文件名', async () => {
+    api.getBrowserConversations.mockReset().mockResolvedValue({
+      total: 1,
+      conversations: [{ id: 9, platform_code: 'kimi', platform_name: 'Kimi', title: '下载会话', message_count: 2, char_count: 10, received_at: '2026-10-21T09:00:00' }]
+    })
+    api.downloadBrowserExport.mockReset().mockResolvedValue('Kimi-下载会话-9.md')
+    const w = await mountHome()
+    await w.findAll('button').find(b => b.text() === '浏览器记录').trigger('click')
+    await flushPromises()
+    await w.findAll('button').find(b => b.text() === '下载 .md').trigger('click')
+    await flushPromises()
+    expect(api.downloadBrowserExport).toHaveBeenCalledWith({ ids: '9' })
+    expect(w.text()).toContain('已下载：Kimi-下载会话-9.md')
+    await w.findAll('button').find(b => b.text() === '下载全部（zip）').trigger('click')
+    await flushPromises()
+    expect(api.downloadBrowserExport).toHaveBeenCalledWith({})
+  })
+
+  it('平台筛选切换后按平台重新加载会话列表', async () => {
+    api.getContextSources.mockReset().mockImplementation(async () => {
+      const payload = sourcesPayload()
+      payload.sources[1].summary.platforms = [{ code: 'kimi', name: 'Kimi', conversations: 2, messages: 8 }]
+      return payload
+    })
+    api.getBrowserConversations.mockReset().mockResolvedValue({ total: 0, conversations: [] })
+    const w = await mountHome()
+    await w.findAll('button').find(b => b.text() === '浏览器记录').trigger('click')
+    await flushPromises()
+    const kimiBtn = w.findAll('button').find(b => b.text() === 'Kimi')
+    expect(kimiBtn).toBeDefined()
+    await kimiBtn.trigger('click')
+    await flushPromises()
+    expect(api.getBrowserConversations).toHaveBeenLastCalledWith(expect.objectContaining({ platform: 'kimi' }))
   })
 
   it('切换自动保存开关调用设置接口', async () => {

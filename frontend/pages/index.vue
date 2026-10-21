@@ -215,6 +215,90 @@
           </div>
         </div>
 
+        <!-- 已同步会话：点击行展开查看消息，可下载为 Markdown（一个会话一个 .md） -->
+        <div class="mt-5">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <h3 class="text-[13px] font-semibold text-[#000000e6]">已同步会话（点击行展开查看内容）</h3>
+            <button
+              type="button"
+              class="cursor-pointer text-[12px] text-[#07c160] hover:underline disabled:cursor-not-allowed disabled:opacity-60"
+              :disabled="convDownloading || !browserConversations.length"
+              @click="downloadAllConversations"
+            >
+              {{ convDownloading ? '正在下载…' : '下载全部（zip）' }}
+            </button>
+          </div>
+
+          <!-- 平台筛选：全部 + 已有同步数据的平台 -->
+          <div v-if="convFilterOptions.length > 1" class="mt-2 flex flex-wrap gap-1.5">
+            <button
+              v-for="opt in convFilterOptions"
+              :key="opt.code || 'all'"
+              type="button"
+              class="rounded-full px-2.5 py-1 text-[11px] transition"
+              :class="convPlatformFilter === opt.code ? 'bg-[#07c160] text-white' : 'bg-[#f2f2f2] text-[#5f5f5f] hover:text-[#07c160]'"
+              @click="changeConvFilter(opt.code)"
+            >
+              {{ opt.name }}
+            </button>
+          </div>
+
+          <div v-if="convMessage" class="mt-2 text-[12px] leading-5 text-[#07964c]">{{ convMessage }}</div>
+
+          <div v-if="convLoading" class="mt-3 text-[12px] text-[#8a8a8a]">正在加载会话列表…</div>
+          <div v-else-if="!browserConversations.length" class="mt-3 text-[12px] text-[#8a8a8a]">
+            暂无已同步会话，在 GPT 平台用扩展上传对话后会自动出现在这里。
+          </div>
+          <div v-else class="mt-3 overflow-hidden rounded-[10px] border border-[#e8e8e8]">
+            <div v-for="c in browserConversations" :key="c.id">
+              <div
+                class="flex cursor-pointer items-center gap-2 border-b border-[#f2f2f2] px-4 py-2.5 text-[12px] hover:bg-[#fafafa]"
+                @click="toggleConversation(c)"
+              >
+                <span class="shrink-0 rounded bg-[#f2f2f2] px-1.5 py-0.5 text-[11px] text-[#5f5f5f]">{{ c.platform_name }}</span>
+                <span class="min-w-0 flex-1 truncate font-medium text-[#222]" :title="c.title">{{ c.title || '未命名会话' }}</span>
+                <span class="shrink-0 text-[#8a8a8a]">{{ c.message_count }} 条</span>
+                <span class="hidden shrink-0 text-[#8a8a8a] md:inline">{{ c.received_at || '' }}</span>
+                <span class="shrink-0 text-[#8a8a8a]">{{ expandedConvId === c.id ? '▲' : '▼' }}</span>
+                <button
+                  type="button"
+                  class="shrink-0 cursor-pointer text-[#07c160] hover:underline disabled:cursor-not-allowed disabled:opacity-60"
+                  :disabled="convDownloading"
+                  @click.stop="downloadConversation(c)"
+                >
+                  下载 .md
+                </button>
+              </div>
+              <div v-if="expandedConvId === c.id" class="border-b border-[#f2f2f2] bg-[#fafafa] px-4 py-3">
+                <div v-if="convDetailLoading" class="text-[12px] text-[#8a8a8a]">正在加载消息…</div>
+                <div v-else class="max-h-[320px] space-y-3 overflow-y-auto">
+                  <div v-for="(m, i) in convDetail?.messages || []" :key="i" class="rounded-[8px] bg-white px-3 py-2">
+                    <div class="flex items-center gap-2 text-[11px] text-[#8a8a8a]">
+                      <span class="font-medium" :class="m.role === 'user' ? 'text-[#07964c]' : 'text-[#1677ff]'">
+                        {{ m.role === 'user' ? '👤 用户' : m.role === 'assistant' ? '🤖 助手' : '📋 系统' }}
+                      </span>
+                      <span v-if="m.msg_time">{{ m.msg_time }}</span>
+                    </div>
+                    <pre class="mt-1 max-h-[220px] overflow-y-auto whitespace-pre-wrap break-words font-sans text-[12px] leading-5 text-[#222]">{{ m.content || '（无内容）' }}</pre>
+                    <details v-if="m.thinking_content" class="mt-1">
+                      <summary class="cursor-pointer text-[11px] text-[#8a8a8a]">思考过程</summary>
+                      <pre class="mt-1 whitespace-pre-wrap break-words text-[11px] leading-5 text-[#8a8a8a]">{{ m.thinking_content }}</pre>
+                    </details>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <button
+            v-if="browserConversations.length < convTotal"
+            type="button"
+            class="mt-2 cursor-pointer text-[12px] text-[#07c160] hover:underline"
+            @click="loadMoreConversations"
+          >
+            加载更多（已显示 {{ browserConversations.length }}/{{ convTotal }}）
+          </button>
+        </div>
+
         <!-- 各 GPT 平台：点击打开平台网站，装好扩展后打开对话即自动抓取 -->
         <div class="mt-5">
           <div class="flex items-center justify-between">
@@ -287,7 +371,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 
-const { getContextSources, getContextSettings, updateContextSettings, triggerWechatSync, getBrowserHistoryStatus, prepareBrowserExtension, openBrowserExtensionPage, openGptPlatform } = useApi()
+const { getContextSources, getContextSettings, updateContextSettings, triggerWechatSync, getBrowserHistoryStatus, prepareBrowserExtension, openBrowserExtensionPage, openGptPlatform, getBrowserConversations, getBrowserConversation, downloadBrowserExport } = useApi()
 
 const sources = ref([])
 const wechatEnabled = ref(true)
@@ -340,9 +424,104 @@ const browserPlatforms = computed(() => {
   return ALL_GPT_PLATFORMS.map(p => ({ ...p, ...(stats[p.code] || {}) }))
 })
 
+// 已同步会话列表：本机数据库读取，支持平台筛选/分页/展开查看/下载 Markdown
+const CONV_PAGE_SIZE = 50
+const browserConversations = ref([])
+const convTotal = ref(0)
+const convPlatformFilter = ref('')
+const convLoading = ref(false)
+const convDownloading = ref(false)
+const expandedConvId = ref(null)
+const convDetail = ref(null)
+const convDetailLoading = ref(false)
+const convMessage = ref('')
+
+const convFilterOptions = computed(() => {
+  const list = [{ code: '', name: '全部' }]
+  for (const p of browserSummary.value?.platforms || []) list.push({ code: p.code, name: p.name })
+  return list
+})
+
+const loadConversations = async (reset = false) => {
+  convLoading.value = true
+  try {
+    const offset = reset ? 0 : browserConversations.value.length
+    const resp = await getBrowserConversations({
+      platform: convPlatformFilter.value || undefined,
+      limit: CONV_PAGE_SIZE,
+      offset
+    })
+    convTotal.value = resp?.total || 0
+    const items = resp?.conversations || []
+    browserConversations.value = reset ? items : [...browserConversations.value, ...items]
+  } catch (e) {
+    error.value = e?.message || '加载已同步会话失败'
+  } finally {
+    convLoading.value = false
+  }
+}
+
+const loadMoreConversations = () => loadConversations(false)
+
+const changeConvFilter = (code) => {
+  if (convPlatformFilter.value === code) return
+  convPlatformFilter.value = code
+  expandedConvId.value = null
+  convDetail.value = null
+  void loadConversations(true)
+}
+
+const toggleConversation = async (c) => {
+  if (expandedConvId.value === c.id) {
+    expandedConvId.value = null
+    convDetail.value = null
+    return
+  }
+  expandedConvId.value = c.id
+  convDetailLoading.value = true
+  convDetail.value = null
+  try {
+    convDetail.value = await getBrowserConversation(c.id)
+  } catch (e) {
+    error.value = e?.message || '加载会话消息失败'
+  } finally {
+    convDetailLoading.value = false
+  }
+}
+
+const downloadConversation = async (c) => {
+  if (convDownloading.value) return
+  convDownloading.value = true
+  try {
+    const filename = await downloadBrowserExport({ ids: String(c.id) })
+    convMessage.value = `已下载：${filename}`
+  } catch (e) {
+    convMessage.value = e?.message || '下载会话失败'
+  } finally {
+    convDownloading.value = false
+  }
+}
+
+const downloadAllConversations = async () => {
+  if (convDownloading.value || !browserConversations.value.length) return
+  convDownloading.value = true
+  try {
+    const params = convPlatformFilter.value ? { platform: convPlatformFilter.value } : {}
+    const filename = await downloadBrowserExport(params)
+    convMessage.value = `已下载：${filename}`
+  } catch (e) {
+    convMessage.value = e?.message || '下载会话失败'
+  } finally {
+    convDownloading.value = false
+  }
+}
+
 const switchCard = (card) => {
   activeCard.value = card
-  if (card === 'browser') void checkExtension(false)
+  if (card === 'browser') {
+    void checkExtension(false)
+    void loadConversations(true)
+  }
 }
 
 const checkExtension = async (showResult = true) => {

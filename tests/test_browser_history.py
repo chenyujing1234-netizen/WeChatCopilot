@@ -289,3 +289,111 @@ def test_is_browser_process_running_parses_tasklist(monkeypatch):
         lambda *a, **kw: _FakeCompleted("信息: 没有运行的任务匹配指定标准。"),
     )
     assert bh._is_browser_process_running("chrome") is False
+
+
+# ---------------- 会话查询与 Markdown 导出 ----------------
+
+def _kimi_conv(chat_id: str, title: str) -> dict:
+    return {
+        "chat_id": chat_id,
+        "title": title,
+        "messages": [
+            {"id": f"{chat_id}-m1", "role": "user", "createTime": 1700000000000, "blocks": [{"text": {"content": "第一个问题"}}]},
+            {"id": f"{chat_id}-m2", "role": "assistant", "createTime": 1700000001000, "blocks": [{"think": {"content": "推理"}}, {"text": {"content": "第一个回答"}}]},
+        ],
+    }
+
+
+def _seed_two_conversations(c):
+    _post_upload(c, "deepseek", _deepseek_single(), conversation_id="ds-1", title="深度求索会话")
+    _post_upload(c, "kimi", _kimi_conv("k1", "Kimi会话"), conversation_id="k1")
+
+
+def test_list_conversations_filters_and_paginates(client):
+    _seed_two_conversations(client)
+
+    resp = client.get("/api/context/browser-history/conversations")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 2
+    assert {c["platform_code"] for c in body["conversations"]} == {"deepseek", "kimi"}
+    assert all(c["platform_name"] for c in body["conversations"])
+
+    resp = client.get("/api/context/browser-history/conversations", params={"platform": "kimi"})
+    body = resp.json()
+    assert body["total"] == 1
+    assert body["conversations"][0]["platform_code"] == "kimi"
+    assert body["conversations"][0]["title"] == "Kimi会话"
+    assert body["conversations"][0]["message_count"] == 2
+
+    resp = client.get("/api/context/browser-history/conversations", params={"limit": 1, "offset": 1})
+    body = resp.json()
+    assert body["total"] == 2
+    assert len(body["conversations"]) == 1
+
+
+def test_get_conversation_detail(client):
+    _seed_two_conversations(client)
+    conv_id = client.get("/api/context/browser-history/conversations", params={"platform": "kimi"}).json()["conversations"][0]["id"]
+
+    resp = client.get(f"/api/context/browser-history/conversations/{conv_id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["platform_name"] == "Kimi"
+    assert [m["role"] for m in body["messages"]] == ["user", "assistant"]
+    assert body["messages"][0]["content"] == "第一个问题"
+    assert body["messages"][1]["thinking_content"] == "推理"
+
+    resp = client.get("/api/context/browser-history/conversations/99999")
+    assert resp.status_code == 404
+
+
+def test_export_single_conversation_as_markdown(client):
+    _seed_two_conversations(client)
+    conv_id = client.get("/api/context/browser-history/conversations", params={"platform": "deepseek"}).json()["conversations"][0]["id"]
+
+    resp = client.get("/api/context/browser-history/export", params={"ids": str(conv_id)})
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/markdown")
+    disposition = resp.headers["content-disposition"]
+    assert "attachment" in disposition and "filename*=UTF-8''" in disposition
+    text = resp.text
+    assert text.startswith("# DeepSeek对话 - 测试会话")
+    assert "## 👤 用户" in text
+    assert "## 🤖 助手" in text
+    assert "你好！" in text
+    assert "> **[思考过程]**" in text
+    assert "---" in text
+
+
+def test_export_multiple_conversations_as_zip(client):
+    _seed_two_conversations(client)
+
+    resp = client.get("/api/context/browser-history/export")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/zip"
+    import io
+    import zipfile
+
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        names = zf.namelist()
+        assert len(names) == 2
+        assert any(n.startswith("Kimi-") and n.endswith(".md") for n in names)
+        assert any(n.startswith("DeepSeek-") and n.endswith(".md") for n in names)
+        kimi_md = next(zf.read(n).decode("utf-8") for n in names if n.startswith("Kimi-"))
+        assert kimi_md.startswith("# Kimi对话 - Kimi会话")
+
+    # 平台筛选导出：单平台仅一个会话时直接返回 .md
+    resp = client.get("/api/context/browser-history/export", params={"platform": "kimi"})
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/markdown")
+    assert "Kimi对话" in resp.text
+
+
+def test_export_rejects_empty_database_and_bad_ids(client):
+    resp = client.get("/api/context/browser-history/export")
+    assert resp.status_code == 404
+    resp = client.get("/api/context/browser-history/export", params={"ids": "abc"})
+    assert resp.status_code == 400
+    resp = client.get("/api/context/browser-history/export", params={"ids": "12345"})
+    assert resp.status_code == 404

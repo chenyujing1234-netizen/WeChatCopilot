@@ -1267,6 +1267,52 @@ export const useApi = () => {
     })
   }
 
+  // 浏览器记录：已同步会话查询与 Markdown 下载（数据来自本机数据库）
+  const getBrowserConversations = async (params = {}) => {
+    const query = new URLSearchParams()
+    if (params.platform) query.set('platform', params.platform)
+    if (params.limit != null) query.set('limit', params.limit)
+    if (params.offset != null) query.set('offset', params.offset)
+    const qs = query.toString()
+    return await request(`/context/browser-history/conversations${qs ? `?${qs}` : ''}`)
+  }
+
+  const getBrowserConversation = async (id) => {
+    return await request(`/context/browser-history/conversations/${encodeURIComponent(String(id))}`)
+  }
+
+  const downloadBrowserExport = async (params = {}) => {
+    const query = new URLSearchParams()
+    if (params.ids) query.set('ids', params.ids)
+    if (params.platform) query.set('platform', params.platform)
+    const qs = query.toString()
+    const url = `${baseURL}/context/browser-history/export${qs ? `?${qs}` : ''}`
+    const response = await fetch(url)
+    if (!response.ok) {
+      throw new Error(`下载会话数据失败（${response.status}）`)
+    }
+    const blob = await response.blob()
+    const disposition = response.headers.get('content-disposition') || ''
+    let filename = 'browser-conversations.md'
+    const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i)
+    if (utf8Match) {
+      filename = decodeURIComponent(utf8Match[1])
+    } else {
+      const plain = disposition.match(/filename="?([^";]+)"?/i)
+      if (plain) filename = plain[1]
+    }
+    if (typeof document === 'undefined') return filename
+    const objectUrl = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = objectUrl
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 60000)
+    return filename
+  }
+
   return {
     pickSystemDirectory,
     getContextSources,
@@ -1277,6 +1323,9 @@ export const useApi = () => {
     prepareBrowserExtension,
     openBrowserExtensionPage,
     openGptPlatform,
+    getBrowserConversations,
+    getBrowserConversation,
+    downloadBrowserExport,
     getImgHelperStatus,
     toggleImgHelper,
     getCdnImageStatus,

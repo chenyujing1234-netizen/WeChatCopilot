@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import io
 import ipaddress
 import json
 import os
@@ -20,12 +21,14 @@ import re
 import shutil
 import sqlite3
 import threading
+import zipfile
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote as _url_quote
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from .app_paths import get_data_dir
 from .logging_config import get_logger
@@ -1121,6 +1124,191 @@ async def open_platform_endpoint(payload: dict):
     if not url.startswith(("http://", "https://")):
         raise HTTPException(400, "无效的平台地址")
     return {"status": "ok", **await _run(open_platform_url, url)}
+
+
+# ---------------- 会话查询与 Markdown 导出（本地前端调用） ----------------
+
+_ROLE_LABELS = {"user": "👤 用户", "assistant": "🤖 助手", "system": "📋 系统"}
+
+
+def _safe_filename(name: str, max_len: int = 60) -> str:
+    """清洗文件名：非法字符替换为 _，去首尾空白与点，超长截断。"""
+    cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", str(name or "").strip()).strip(" .")
+    return cleaned[:max_len].strip(" .") or "未命名"
+
+
+def _conversation_markdown(conv: sqlite3.Row, messages: list[sqlite3.Row]) -> str:
+    """会话 → Markdown 文本（格式对齐原扩展的 md 导出：标题/统计/按序消息/分隔线）。"""
+    meta = PLATFORM_META.get(conv["platform_code"], {})
+    platform_name = meta.get("name") or conv["platform_code"]
+    lines = [
+        f"# {platform_name}对话 - {conv['title'] or '未命名会话'}",
+        "",
+        f"> 生成时间：{_now_iso()}",
+        f"> 消息数：{len(messages)} | 总字数：{conv['char_count'] or 0} | 平台：{platform_name}",
+        "",
+    ]
+    for m in messages:
+        role = _ROLE_LABELS.get(str(m["role"] or ""), str(m["role"] or "未知"))
+        lines.append(f"## {role}")
+        lines.append(f"\n*时间: {m['msg_time']}*\n" if m["msg_time"] else "")
+        if m["thinking_content"]:
+            quoted = "\n".join(f"> {ln}" for ln in str(m["thinking_content"]).splitlines())
+            lines.append(f"> **[思考过程]**\n{quoted}\n")
+        lines.append(f"{str(m['content'] or '').strip() or '（无内容）'}\n")
+        lines.append("---\n")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _md_filename(conv: sqlite3.Row) -> str:
+    meta = PLATFORM_META.get(conv["platform_code"], {})
+    platform_name = meta.get("name") or conv["platform_code"]
+    return f"{_safe_filename(platform_name)}-{_safe_filename(conv['title'] or '未命名会话')}-{conv['id']}.md"
+
+
+def _content_disposition(filename: str) -> str:
+    ascii_name = re.sub(r"[^\x20-\x7e]", "_", filename).strip() or "export.md"
+    return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{_url_quote(filename)}'
+
+
+def _load_conversation(conv_id: int) -> tuple[sqlite3.Row, list[sqlite3.Row]]:
+    db = _get_db()
+    with _DB_LOCK:
+        conv = db.execute("SELECT * FROM conversations WHERE id=?", (conv_id,)).fetchone()
+        if not conv:
+            raise HTTPException(404, "会话不存在")
+        messages = db.execute(
+            "SELECT * FROM messages WHERE conversation_row_id=? ORDER BY seq", (conv_id,)
+        ).fetchall()
+    return conv, messages
+
+
+@manage_router.get("/conversations", summary="已同步会话列表（支持平台筛选/分页）")
+async def list_conversations(platform: str = "", limit: int = 50, offset: int = 0):
+    platform = (platform or "").strip()
+    limit = max(1, min(int(limit), 200))
+    offset = max(0, int(offset))
+
+    def query():
+        db = _get_db()
+        where, params = "", []
+        if platform:
+            where = "WHERE platform_code=?"
+            params.append(platform)
+        with _DB_LOCK:
+            total = db.execute(f"SELECT COUNT(*) AS c FROM conversations {where}", params).fetchone()["c"]
+            rows = db.execute(
+                "SELECT id, platform_code, conversation_id, title, message_count, char_count,"
+                " first_message_at, last_message_at, received_at"
+                f" FROM conversations {where} ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?",
+                [*params, limit, offset],
+            ).fetchall()
+        return {
+            "total": total,
+            "conversations": [
+                {
+                    **{k: r[k] for k in r.keys()},
+                    "platform_name": PLATFORM_META.get(r["platform_code"], {}).get("name", r["platform_code"]),
+                }
+                for r in rows
+            ],
+        }
+
+    return await _run(query)
+
+
+@manage_router.get("/conversations/{conv_id}", summary="会话消息明细")
+async def get_conversation(conv_id: int):
+    def query():
+        conv, messages = _load_conversation(conv_id)
+        return {
+            "id": conv["id"],
+            "platform_code": conv["platform_code"],
+            "platform_name": PLATFORM_META.get(conv["platform_code"], {}).get("name", conv["platform_code"]),
+            "title": conv["title"],
+            "message_count": conv["message_count"],
+            "char_count": conv["char_count"],
+            "first_message_at": conv["first_message_at"],
+            "last_message_at": conv["last_message_at"],
+            "received_at": conv["received_at"],
+            "messages": [
+                {
+                    "role": m["role"],
+                    "content": m["content"],
+                    "thinking_content": m["thinking_content"],
+                    "msg_time": m["msg_time"],
+                }
+                for m in messages
+            ],
+        }
+
+    return await _run(query)
+
+
+@manage_router.get("/export", summary="下载会话为 Markdown（单会话 .md，多会话 zip，仅本机数据）")
+async def export_conversations(ids: str = "", platform: str = ""):
+    """数据全部来自本机数据库（<data_dir>/browser_history），无任何远程拉取。"""
+    ids = (ids or "").strip()
+    platform = (platform or "").strip()
+
+    def build():
+        db = _get_db()
+        id_list = [t.strip() for t in ids.split(",") if t.strip().isdigit()] if ids else []
+        if ids and not id_list:
+            raise HTTPException(400, "ids 参数无效")
+        with _DB_LOCK:
+            if id_list:
+                placeholders = ",".join("?" * len(id_list))
+                convs = db.execute(
+                    f"SELECT * FROM conversations WHERE id IN ({placeholders}) ORDER BY platform_code, id",
+                    id_list,
+                ).fetchall()
+                if not convs:
+                    raise HTTPException(404, "会话不存在")
+            else:
+                where, params = "", []
+                if platform:
+                    where = "WHERE platform_code=?"
+                    params.append(platform)
+                convs = db.execute(
+                    f"SELECT * FROM conversations {where} ORDER BY platform_code, id", params
+                ).fetchall()
+                if not convs:
+                    raise HTTPException(404, "暂无可下载的会话")
+
+            if len(convs) == 1:
+                conv = convs[0]
+                messages = db.execute(
+                    "SELECT * FROM messages WHERE conversation_row_id=? ORDER BY seq", (conv["id"],)
+                ).fetchall()
+                return Response(
+                    content=_conversation_markdown(conv, messages),
+                    media_type="text/markdown; charset=utf-8",
+                    headers={"Content-Disposition": _content_disposition(_md_filename(conv))},
+                )
+
+            buf = io.BytesIO()
+            used: set[str] = set()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for conv in convs:
+                    messages = db.execute(
+                        "SELECT * FROM messages WHERE conversation_row_id=? ORDER BY seq", (conv["id"],)
+                    ).fetchall()
+                    name = _md_filename(conv)
+                    base, n = name[:-3], 2
+                    while name in used:
+                        name = f"{base}_{n}.md"
+                        n += 1
+                    used.add(name)
+                    zf.writestr(name, _conversation_markdown(conv, messages))
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            return Response(
+                content=buf.getvalue(),
+                media_type="application/zip",
+                headers={"Content-Disposition": _content_disposition(f"浏览器对话导出-{len(convs)}个会话-{stamp}.zip")},
+            )
+
+    return await _run(build)
 
 
 async def _run(func, *args):
