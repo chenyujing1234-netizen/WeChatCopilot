@@ -152,7 +152,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 
 const { getContextSources, getContextSettings, updateContextSettings, triggerWechatSync } = useApi()
 
@@ -330,7 +330,13 @@ const goDetection = () => { detectionOpen.value = true }
 const openExportDialog = () => { exportDialogOpen.value = true }
 const closeExportDialog = () => { exportDialogOpen.value = false }
 
-onMounted(() => { void reload() })
+// 每分钟刷新一次状态：自动保存按小时轮转，页面开着时“最近保存”等也要能看到最新值
+let reloadTimer = null
+onMounted(() => {
+  void reload()
+  reloadTimer = setInterval(() => { void reload() }, 60_000)
+})
+onUnmounted(() => { if (reloadTimer) clearInterval(reloadTimer) })
 </script>
 
 <style scoped>
