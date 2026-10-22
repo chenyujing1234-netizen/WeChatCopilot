@@ -13,7 +13,11 @@ const api = {
   openGptPlatform: vi.fn(),
   getBrowserConversations: vi.fn(),
   getBrowserConversation: vi.fn(),
-  downloadBrowserExport: vi.fn()
+  downloadBrowserExport: vi.fn(),
+  getBrowserRemoteConfig: vi.fn(),
+  saveBrowserRemoteConfig: vi.fn(),
+  listBrowserRemoteDevices: vi.fn(),
+  pullBrowserRemoteConversations: vi.fn()
 }
 let wrapper
 let navigateToMock
@@ -44,6 +48,10 @@ beforeEach(() => {
   api.getBrowserConversations.mockReset().mockResolvedValue({ total: 0, conversations: [] })
   api.getBrowserConversation.mockReset().mockResolvedValue({ id: 0, messages: [] })
   api.downloadBrowserExport.mockReset().mockResolvedValue('export.md')
+  api.getBrowserRemoteConfig.mockReset().mockResolvedValue({ server_url: '', token: '', device_id: '', local_device_id: '' })
+  api.saveBrowserRemoteConfig.mockReset().mockResolvedValue({ server_url: '', token: '', device_id: '', local_device_id: '' })
+  api.listBrowserRemoteDevices.mockReset().mockResolvedValue({ devices: [] })
+  api.pullBrowserRemoteConversations.mockReset().mockResolvedValue({ server_total: 0, imported: 0, skipped: 0, failed: 0 })
 })
 
 afterEach(() => { wrapper?.unmount(); vi.unstubAllGlobals() })
@@ -222,6 +230,53 @@ describe('上下文中心首页', () => {
     await kimiBtn.trigger('click')
     await flushPromises()
     expect(api.getBrowserConversations).toHaveBeenLastCalledWith(expect.objectContaining({ platform: 'kimi' }))
+  })
+
+  it('切换到浏览器记录后加载服务端拉取配置并展示区域', async () => {
+    api.getBrowserRemoteConfig.mockReset().mockResolvedValue({
+      server_url: 'http://192.168.1.5:8321',
+      token: 'srv-token',
+      device_id: '',
+      local_device_id: 'dev-my-laptop'
+    })
+    const w = await mountHome()
+    await w.findAll('button').find(b => b.text() === '浏览器记录').trigger('click')
+    await flushPromises()
+    expect(api.getBrowserRemoteConfig).toHaveBeenCalled()
+    expect(w.text()).toContain('从服务端拉取')
+    expect(w.text()).toContain('dev-my-laptop')
+    expect(w.find('input[placeholder="例如 http://192.168.1.5:8321"]').element.value).toBe('http://192.168.1.5:8321')
+  })
+
+  it('点击从服务端拉取调用接口并刷新会话列表', async () => {
+    api.pullBrowserRemoteConversations.mockReset().mockResolvedValue({ server_total: 5, imported: 3, skipped: 2, failed: 0 })
+    const w = await mountHome()
+    await w.findAll('button').find(b => b.text() === '浏览器记录').trigger('click')
+    await flushPromises()
+    await w.findAll('button').find(b => b.text() === '从服务端拉取').trigger('click')
+    await flushPromises()
+    expect(api.pullBrowserRemoteConversations).toHaveBeenCalled()
+    expect(w.text()).toContain('拉取完成：服务端 5 个会话，导入 3 个（跳过 2，失败 0）')
+    // 拉取后刷新本地会话列表
+    expect(api.getBrowserConversations.mock.calls.filter(c => (c[0] || {}).offset === 0).length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('查看服务端设备展示设备列表并可选中', async () => {
+    api.listBrowserRemoteDevices.mockReset().mockResolvedValue({
+      devices: [
+        { device_id: 'dev-a', conversations: 3, messages: 10, last_active: '2026-01-01' },
+        { device_id: 'dev-b', conversations: 1, messages: 4, last_active: '2026-01-02' }
+      ]
+    })
+    const w = await mountHome()
+    await w.findAll('button').find(b => b.text() === '浏览器记录').trigger('click')
+    await flushPromises()
+    await w.findAll('button').find(b => b.text() === '查看服务端设备').trigger('click')
+    await flushPromises()
+    expect(api.listBrowserRemoteDevices).toHaveBeenCalled()
+    expect(w.text()).toContain('dev-a')
+    expect(w.text()).toContain('dev-b')
+    expect(w.text()).toContain('3 个会话 / 10 条消息')
   })
 
   it('切换自动保存开关调用设置接口', async () => {

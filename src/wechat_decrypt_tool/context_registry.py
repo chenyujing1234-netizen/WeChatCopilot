@@ -65,13 +65,16 @@ def load_settings() -> dict[str, Any]:
 
 def save_settings(settings: dict[str, Any]) -> dict[str, Any]:
     normalized = load_settings()
+    # 各源仅允许更新自己的设置键：开关通用；微信数据源支持保存位置与归档内容；
+    # 浏览器记录源支持 remote（服务端拉取配置：地址/token/设备ID）
+    extra_allowed = {
+        "wechat": {"data_dir", "archive_content"},
+        "browser_history": {"remote"},
+    }
     for source_id, overrides in (settings or {}).items():
         if source_id not in normalized or not isinstance(overrides, dict):
             continue
-        # 各源仅允许更新自己的设置键：开关通用，保存位置与归档内容仅微信数据源支持
-        allowed_keys = {"enabled"} | (
-            {"data_dir", "archive_content"} if source_id == "wechat" else set()
-        )
+        allowed_keys = {"enabled"} | extra_allowed.get(source_id, set())
         normalized[source_id].update(
             {key: value for key, value in overrides.items() if key in allowed_keys}
         )

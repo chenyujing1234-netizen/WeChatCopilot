@@ -21,6 +21,9 @@ import re
 import shutil
 import sqlite3
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 import zipfile
 from pathlib import Path
 from typing import Any, Optional
@@ -133,6 +136,11 @@ def _get_db() -> sqlite3.Connection:
             );
             """
         )
+        # 设备隔离迁移：旧库补充 device_id 列（扩展按浏览器生成并持久化的设备标识）
+        try:
+            conn.execute("ALTER TABLE conversations ADD COLUMN device_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
         conn.commit()
         _DB_CONN = conn
     return _DB_CONN
@@ -573,7 +581,7 @@ def _content_hash(messages: list[dict]) -> str:
     return h.hexdigest()
 
 
-def _upsert_conversation(platform: str, n: dict) -> dict:
+def _upsert_conversation(platform: str, n: dict, device_id: str | None = None) -> dict:
     db = _get_db()
     now = _now_iso()
     char_count = sum(
@@ -591,7 +599,8 @@ def _upsert_conversation(platform: str, n: dict) -> dict:
         ).fetchone()
         if existing and existing["content_hash"] and existing["content_hash"] == chash:
             db.execute(
-                "UPDATE conversations SET received_at=? WHERE id=?", (now, existing["id"])
+                "UPDATE conversations SET received_at=?, device_id=COALESCE(?, device_id) WHERE id=?",
+                (now, device_id, existing["id"]),
             )
             return {"skipped": True, "conversation_id": n["conversation_id"], "message_count": len(n["messages"])}
 
@@ -599,18 +608,18 @@ def _upsert_conversation(platform: str, n: dict) -> dict:
             """INSERT INTO conversations
                  (platform_code, conversation_id, title, message_count, char_count,
                   first_message_at, last_message_at, platform_created_at, platform_updated_at,
-                  content_hash, received_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                  content_hash, received_at, device_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(platform_code, conversation_id) DO UPDATE SET
                  title=excluded.title, message_count=excluded.message_count,
                  char_count=excluded.char_count, first_message_at=excluded.first_message_at,
                  last_message_at=excluded.last_message_at, platform_created_at=excluded.platform_created_at,
                  platform_updated_at=excluded.platform_updated_at, content_hash=excluded.content_hash,
-                 received_at=excluded.received_at""",
+                 received_at=excluded.received_at, device_id=COALESCE(excluded.device_id, conversations.device_id)""",
             (
                 platform, n["conversation_id"], (n.get("title") or "")[:512] or None,
                 len(n["messages"]), char_count, first, last,
-                n.get("platform_created_at"), n.get("platform_updated_at"), chash, now,
+                n.get("platform_created_at"), n.get("platform_updated_at"), chash, now, device_id,
             ),
         )
         row = db.execute(
@@ -679,6 +688,8 @@ async def upload_conversation(request: Request):
     platform = re.sub(r"_(title|chat)$", "", str(payload.get("platform") or ""))
     if not platform:
         return _upload_json({"ok": False, "error": "缺少 platform"}, 400)
+    # 设备标识：body.device_id 优先，其次 X-Device-Id 头（与原服务一致）
+    device_id = str(payload.get("device_id") or request.headers.get("x-device-id") or "").strip()[:64] or None
     try:
         n = normalize_conversation(
             platform,
@@ -690,7 +701,7 @@ async def upload_conversation(request: Request):
     if not n["messages"]:
         return _upload_json({"ok": False, "error": "会话无消息"}, 400)
     try:
-        result = _upsert_conversation(platform, n)
+        result = _upsert_conversation(platform, n, device_id)
         refresh_manifest()
     except Exception:
         logger.exception("[browser_history] /upload 入库失败 platform=%s", platform)
@@ -1338,6 +1349,184 @@ async def export_conversations(ids: str = "", platform: str = ""):
             )
 
     return await _run(build)
+
+
+# ---------------- 从服务端拉取（按 device_id 设备隔离，仅本机浏览器数据） ----------------
+
+def _local_device_id() -> str | None:
+    """本机最近一次上传使用的设备 ID（扩展在本机浏览器生成并持久化）。"""
+    db = _get_db()
+    with _DB_LOCK:
+        row = db.execute(
+            "SELECT device_id FROM conversations WHERE device_id IS NOT NULL"
+            " ORDER BY received_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+    return row["device_id"] if row else None
+
+
+def _remote_settings() -> dict[str, str]:
+    from .context_registry import load_settings
+
+    remote = (load_settings().get("browser_history") or {}).get("remote") or {}
+    return {
+        "server_url": str(remote.get("server_url") or "").strip(),
+        "token": str(remote.get("token") or "").strip(),
+        "device_id": str(remote.get("device_id") or "").strip(),
+    }
+
+
+def _save_remote_settings(server_url: str, token: str, device_id: str) -> None:
+    from .context_registry import load_settings, save_settings
+
+    settings = load_settings()
+    remote = settings.setdefault("browser_history", {}).setdefault("remote", {})
+    remote["server_url"] = server_url.strip()
+    remote["token"] = token.strip()
+    remote["device_id"] = device_id.strip()
+    save_settings(settings)
+
+
+def _remote_get(server_url: str, path: str, token: str, params: dict[str, str]) -> dict:
+    """调用远程上传服务的 GET 接口（/download、/devices），返回解析后的 JSON。
+
+    兼容原「AI对话导出」上传服务（Node/MySQL）的查询协议：token 与 device_id 走 query。
+    """
+    base = server_url.rstrip("/")
+    if not base.startswith(("http://", "https://")):
+        raise HTTPException(400, "服务端地址必须以 http:// 或 https:// 开头")
+    if not token:
+        raise HTTPException(400, "缺少服务端 token")
+    url = f"{base}{path}?{urllib.parse.urlencode({'token': token, **params})}"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:200]
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(502, f"服务端拒绝（HTTP {e.code}）：{detail or e.reason}") from None
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise HTTPException(502, f"无法连接服务端：{getattr(e, 'reason', e)}") from None
+    if not isinstance(data, dict) or not data.get("ok"):
+        raise HTTPException(502, "服务端返回异常数据")
+    return data
+
+
+def _pull_from_remote(server_url: str, token: str, device_id: str, platform: str = "") -> dict:
+    """从远程服务端拉取指定设备的全部会话并入库（服务端已按 device_id 隔离）。"""
+    params = {"device_id": device_id}
+    if platform:
+        params["platform"] = platform
+    data = _remote_get(server_url, "/download", token, params)
+    convs = data.get("conversations") or []
+    imported = skipped = failed = 0
+    for c in convs:
+        plat = re.sub(r"_(title|chat)$", "", str(c.get("platform") or ""))
+        if plat not in PLATFORM_META:
+            failed += 1
+            continue
+        n = {
+            "conversation_id": str(c.get("conversation_id") or ""),
+            "title": c.get("title"),
+            "platform_created_at": _to_dt(c.get("platform_created_at")),
+            "platform_updated_at": _to_dt(c.get("platform_updated_at")),
+            "messages": [
+                {
+                    "message_id": str(m.get("message_id") or ""),
+                    "role": m.get("role"),
+                    "content": m.get("content"),
+                    "thinking_content": m.get("thinking_content"),
+                    "msg_time": _to_dt(m.get("msg_time")),
+                }
+                for m in (c.get("messages") or [])
+            ],
+        }
+        if not n["conversation_id"] or not n["messages"]:
+            failed += 1
+            continue
+        try:
+            result = _upsert_conversation(plat, n, device_id=device_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("[browser_history] 远程会话入库失败 platform=%s conv=%s", plat, n["conversation_id"])
+            failed += 1
+            continue
+        if result.get("skipped"):
+            skipped += 1
+        else:
+            imported += 1
+    return {
+        "device_id": device_id,
+        "server_url": server_url.rstrip("/"),
+        "server_total": len(convs),
+        "imported": imported,
+        "skipped": skipped,
+        "failed": failed,
+    }
+
+
+@manage_router.get("/remote/config", summary="服务端拉取配置与本机设备 ID")
+async def get_remote_config():
+    def query():
+        cfg = _remote_settings()
+        return {
+            "server_url": cfg["server_url"],
+            "token": cfg["token"],
+            "device_id": cfg["device_id"],
+            "local_device_id": _local_device_id(),
+        }
+
+    return await _run(query)
+
+
+@manage_router.post("/remote/config", summary="保存服务端地址 / token / 设备 ID")
+async def save_remote_config(payload: dict):
+    def persist():
+        _save_remote_settings(
+            str(payload.get("server_url") or ""),
+            str(payload.get("token") or ""),
+            str(payload.get("device_id") or ""),
+        )
+        cfg = _remote_settings()
+        return {**cfg, "local_device_id": _local_device_id()}
+
+    return {"status": "ok", **await _run(persist)}
+
+
+@manage_router.post("/remote/devices", summary="列出服务端已见设备（远程 /devices，便于确认本机设备 ID）")
+async def list_remote_devices(payload: dict):
+    def call():
+        cfg = _remote_settings()
+        server_url = str(payload.get("server_url") or cfg["server_url"]).strip()
+        token = str(payload.get("token") or cfg["token"]).strip()
+        data = _remote_get(server_url, "/devices", token, {})
+        return {"devices": data.get("devices") or []}
+
+    return {"status": "ok", **await _run(call)}
+
+
+@manage_router.post("/remote/pull", summary="从服务端拉取本机设备的会话（设备隔离，仅本机浏览器上传的数据）")
+async def pull_remote_conversations(payload: dict):
+    payload = payload or {}
+
+    def job():
+        cfg = _remote_settings()
+        server_url = str(payload.get("server_url") or cfg["server_url"]).strip()
+        token = str(payload.get("token") or cfg["token"]).strip()
+        device_id = str(payload.get("device_id") or cfg["device_id"] or "").strip()[:64] or _local_device_id() or ""
+        if not server_url:
+            raise HTTPException(400, "请先配置服务端地址")
+        if not token:
+            raise HTTPException(400, "请先配置服务端 token")
+        if not device_id:
+            raise HTTPException(400, "无法确定本机设备 ID：请先在本机浏览器用扩展上传一次，或在配置中指定设备 ID")
+        result = _pull_from_remote(server_url, token, device_id, str(payload.get("platform") or "").strip())
+        refresh_manifest()
+        return result
+
+    return {"status": "ok", **await _run(job)}
 
 
 async def _run(func, *args):

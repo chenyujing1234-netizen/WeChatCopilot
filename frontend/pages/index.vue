@@ -215,6 +215,80 @@
           </div>
         </div>
 
+        <!-- 从服务端拉取：按设备 ID 隔离，只拉取本机浏览器上传的数据 -->
+        <div class="mt-5 rounded-[10px] bg-[#fafafa] px-4 py-3 text-[12px] text-[#5f5f5f]">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="shrink-0 text-[#8a8a8a]">从服务端拉取</span>
+            <span class="min-w-0 flex-1 text-[#8a8a8a]">从「AI对话导出」上传服务拉取数据，按设备 ID 隔离，只拉本机浏览器上传的会话</span>
+          </div>
+          <div class="mt-2 grid gap-2 md:grid-cols-2">
+            <label class="flex items-center gap-2">
+              <span class="w-16 shrink-0 text-[#8a8a8a]">服务端地址</span>
+              <input
+                v-model="remoteConfig.server_url"
+                type="text"
+                placeholder="例如 http://192.168.1.5:8321"
+                class="min-w-0 flex-1 rounded-[6px] border border-[#e4e4e4] bg-white px-2 py-1 outline-none transition focus:border-[#07c160]"
+                :disabled="remoteBusy"
+              />
+            </label>
+            <label class="flex items-center gap-2">
+              <span class="w-16 shrink-0 text-[#8a8a8a]">Token</span>
+              <input
+                v-model="remoteConfig.token"
+                type="text"
+                placeholder="服务端 config.json 中的 token"
+                class="min-w-0 flex-1 rounded-[6px] border border-[#e4e4e4] bg-white px-2 py-1 outline-none transition focus:border-[#07c160]"
+                :disabled="remoteBusy"
+              />
+            </label>
+          </div>
+          <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5">
+            <span class="shrink-0 text-[#8a8a8a]">本机设备 ID</span>
+            <code class="min-w-0 max-w-full truncate rounded bg-[#f2f2f2] px-2 py-1 text-[11px] text-[#222]">
+              {{ remoteDeviceChoice || remoteDeviceId || '未识别（在本机浏览器用扩展上传一次后自动识别）' }}
+            </code>
+            <button
+              type="button"
+              class="shrink-0 cursor-pointer text-[#07c160] hover:underline disabled:cursor-not-allowed disabled:opacity-60"
+              :disabled="remoteBusy"
+              @click="saveRemoteConfig"
+            >
+              {{ remoteBusy ? '处理中…' : '保存配置' }}
+            </button>
+            <button
+              type="button"
+              class="shrink-0 cursor-pointer text-[#07c160] hover:underline disabled:cursor-not-allowed disabled:opacity-60"
+              :disabled="remoteBusy"
+              @click="loadRemoteDevices"
+            >
+              查看服务端设备
+            </button>
+            <button
+              type="button"
+              class="shrink-0 cursor-pointer font-medium text-[#07c160] hover:underline disabled:cursor-not-allowed disabled:opacity-60"
+              :disabled="remoteBusy"
+              @click="pullRemote"
+            >
+              {{ remoteBusy ? '正在拉取…' : '从服务端拉取' }}
+            </button>
+          </div>
+          <!-- 服务端设备列表：选择本机的设备（每台浏览器一个 ID） -->
+          <div v-if="remoteDevices.length" class="mt-2 space-y-1">
+            <div class="text-[#8a8a8a]">服务端已见设备（点击选中本机的设备）：</div>
+            <label
+              v-for="d in remoteDevices"
+              :key="d.device_id"
+              class="flex cursor-pointer items-center gap-2 rounded-[6px] bg-white px-2 py-1"
+            >
+              <input v-model="remoteDeviceChoice" type="radio" :value="d.device_id" class="accent-[#07c160]" />
+              <span class="min-w-0 flex-1 truncate text-[#222]">{{ d.device_id }}</span>
+              <span class="shrink-0 text-[#8a8a8a]">{{ d.conversations }} 个会话 / {{ d.messages }} 条消息</span>
+            </label>
+          </div>
+          <p v-if="remoteMessage" class="mt-2 leading-5" :class="remoteMessageOk ? 'text-[#07964c]' : 'text-red-500'">{{ remoteMessage }}</p>
+        </div>
+
         <!-- 已同步会话：点击行展开查看消息，可下载为 Markdown（一个会话一个 .md） -->
         <div class="mt-5">
           <div class="flex flex-wrap items-center justify-between gap-2">
@@ -371,7 +445,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 
-const { getContextSources, getContextSettings, updateContextSettings, triggerWechatSync, getBrowserHistoryStatus, prepareBrowserExtension, openBrowserExtensionPage, openGptPlatform, getBrowserConversations, getBrowserConversation, downloadBrowserExport } = useApi()
+const { getContextSources, getContextSettings, updateContextSettings, triggerWechatSync, getBrowserHistoryStatus, prepareBrowserExtension, openBrowserExtensionPage, openGptPlatform, getBrowserConversations, getBrowserConversation, downloadBrowserExport, getBrowserRemoteConfig, saveBrowserRemoteConfig, listBrowserRemoteDevices, pullBrowserRemoteConversations } = useApi()
 
 const sources = ref([])
 const wechatEnabled = ref(true)
@@ -516,11 +590,93 @@ const downloadAllConversations = async () => {
   }
 }
 
+// 从服务端拉取：按 device_id 隔离，只拉本机浏览器上传的会话
+const remoteConfig = ref({ server_url: '', token: '' })
+const remoteDeviceId = ref('')
+const remoteDeviceChoice = ref('')
+const remoteDevices = ref([])
+const remoteBusy = ref(false)
+const remoteMessage = ref('')
+const remoteMessageOk = ref(true)
+
+const loadRemoteConfig = async () => {
+  try {
+    const resp = await getBrowserRemoteConfig()
+    remoteConfig.value = { server_url: resp?.server_url || '', token: resp?.token || '' }
+    remoteDeviceId.value = resp?.local_device_id || ''
+    remoteDeviceChoice.value = resp?.device_id || resp?.local_device_id || ''
+  } catch {
+    // 配置读取失败不打扰用户（本地无配置时静默）
+  }
+}
+
+const saveRemoteConfig = async () => {
+  remoteBusy.value = true
+  try {
+    const resp = await saveBrowserRemoteConfig({
+      server_url: remoteConfig.value.server_url,
+      token: remoteConfig.value.token,
+      device_id: remoteDeviceChoice.value
+    })
+    remoteDeviceId.value = resp?.local_device_id || remoteDeviceId.value
+    remoteMessage.value = '配置已保存'
+    remoteMessageOk.value = true
+  } catch (e) {
+    remoteMessage.value = e?.message || '保存配置失败'
+    remoteMessageOk.value = false
+  } finally {
+    remoteBusy.value = false
+  }
+}
+
+const loadRemoteDevices = async () => {
+  remoteBusy.value = true
+  try {
+    const resp = await listBrowserRemoteDevices({
+      server_url: remoteConfig.value.server_url,
+      token: remoteConfig.value.token
+    })
+    remoteDevices.value = resp?.devices || []
+    if (!remoteDeviceChoice.value && remoteDevices.value.length === 1) {
+      remoteDeviceChoice.value = remoteDevices.value[0].device_id
+    }
+    remoteMessage.value = remoteDevices.value.length
+      ? `服务端共 ${remoteDevices.value.length} 个设备，请选中本机的设备后拉取`
+      : '服务端暂无设备数据（需先用扩展上传一次）'
+    remoteMessageOk.value = !!remoteDevices.value.length
+  } catch (e) {
+    remoteMessage.value = e?.message || '获取服务端设备列表失败'
+    remoteMessageOk.value = false
+  } finally {
+    remoteBusy.value = false
+  }
+}
+
+const pullRemote = async () => {
+  remoteBusy.value = true
+  try {
+    const resp = await pullBrowserRemoteConversations({
+      server_url: remoteConfig.value.server_url,
+      token: remoteConfig.value.token,
+      device_id: remoteDeviceChoice.value || undefined
+    })
+    remoteMessage.value = `拉取完成：服务端 ${resp?.server_total ?? 0} 个会话，导入 ${resp?.imported ?? 0} 个（跳过 ${resp?.skipped ?? 0}，失败 ${resp?.failed ?? 0}）`
+    remoteMessageOk.value = true
+    await loadConversations(true)
+  } catch (e) {
+    remoteMessage.value = e?.message || '从服务端拉取失败'
+    remoteMessageOk.value = false
+  } finally {
+    remoteBusy.value = false
+  }
+}
+
 const switchCard = (card) => {
   activeCard.value = card
   if (card === 'browser') {
     void checkExtension(false)
     void loadConversations(true)
+    void loadRemoteConfig()
   }
 }
 

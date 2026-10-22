@@ -1313,6 +1313,32 @@ export const useApi = () => {
     return filename
   }
 
+  // 浏览器记录：从服务端按 device_id 拉取本机设备上传的会话
+  const getBrowserRemoteConfig = async () => {
+    return await request('/context/browser-history/remote/config')
+  }
+
+  const saveBrowserRemoteConfig = async (config) => {
+    return await request('/context/browser-history/remote/config', {
+      method: 'POST',
+      body: config
+    })
+  }
+
+  const listBrowserRemoteDevices = async (params = {}) => {
+    return await request('/context/browser-history/remote/devices', {
+      method: 'POST',
+      body: params
+    })
+  }
+
+  const pullBrowserRemoteConversations = async (params = {}) => {
+    return await request('/context/browser-history/remote/pull', {
+      method: 'POST',
+      body: params
+    })
+  }
+
   return {
     pickSystemDirectory,
     getContextSources,
@@ -1326,6 +1352,10 @@ export const useApi = () => {
     getBrowserConversations,
     getBrowserConversation,
     downloadBrowserExport,
+    getBrowserRemoteConfig,
+    saveBrowserRemoteConfig,
+    listBrowserRemoteDevices,
+    pullBrowserRemoteConversations,
     getImgHelperStatus,
     toggleImgHelper,
     getCdnImageStatus,

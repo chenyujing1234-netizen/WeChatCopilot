@@ -38,15 +38,18 @@ def _deepseek_single() -> dict:
     }
 
 
-def _post_upload(c, platform, conversation, conversation_id="c1", title=None, token=bh.UPLOAD_TOKEN):
+def _post_upload(c, platform, conversation, conversation_id="c1", title=None, token=bh.UPLOAD_TOKEN, device_id=None):
+    payload = {
+        "platform": platform,
+        "conversation": conversation,
+        "conversation_id": conversation_id,
+        "title": title,
+    }
+    if device_id:
+        payload["device_id"] = device_id
     return c.post(
         "/upload",
-        json={
-            "platform": platform,
-            "conversation": conversation,
-            "conversation_id": conversation_id,
-            "title": title,
-        },
+        json=payload,
         headers={"X-Upload-Token": token},
     )
 
@@ -467,3 +470,160 @@ def test_export_rejects_empty_database_and_bad_ids(client):
     assert resp.status_code == 400
     resp = client.get("/api/context/browser-history/export", params={"ids": "12345"})
     assert resp.status_code == 404
+
+
+# ---------------- 从服务端拉取（按 device_id 设备隔离） ----------------
+
+def test_upload_stores_device_id(client):
+    resp = _post_upload(client, "deepseek", _deepseek_single(), device_id="dev-local-1")
+    assert resp.status_code == 200 and resp.json()["ok"]
+
+    db = bh._get_db()
+    with bh._DB_LOCK:
+        row = db.execute("SELECT device_id FROM conversations").fetchone()
+    assert row["device_id"] == "dev-local-1"
+    assert bh._local_device_id() == "dev-local-1"
+
+
+def test_remote_config_save_and_load(client):
+    resp = client.get("/api/context/browser-history/remote/config")
+    assert resp.status_code == 200
+    assert resp.json()["server_url"] == ""
+
+    resp = client.post(
+        "/api/context/browser-history/remote/config",
+        json={"server_url": "http://192.168.1.5:8321/", "token": "srv-token", "device_id": "dev-9"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["server_url"] == "http://192.168.1.5:8321/"
+    assert body["device_id"] == "dev-9"
+
+    resp = client.get("/api/context/browser-history/remote/config")
+    body = resp.json()
+    assert body["token"] == "srv-token"
+    assert body["device_id"] == "dev-9"
+
+
+_REMOTE_DOWNLOAD = {
+    "ok": True,
+    "device_id": "dev-remote",
+    "total": 2,
+    "conversations": [
+        {
+            "platform": "deepseek",
+            "conversation_id": "r-1",
+            "title": "远程会话1",
+            "platform_created_at": None,
+            "platform_updated_at": "2026-01-02 10:00:00",
+            "messages": [
+                {"message_id": "m1", "role": "user", "content": "远程问题", "thinking_content": None, "msg_time": "2026-01-02 10:00:00"},
+                {"message_id": "m2", "role": "assistant", "content": "远程回答", "thinking_content": "远程推理", "msg_time": "2026-01-02 10:00:05"},
+            ],
+        },
+        {
+            "platform": "kimi",
+            "conversation_id": "r-2",
+            "title": "远程会话2",
+            "platform_created_at": None,
+            "platform_updated_at": None,
+            "messages": [
+                {"message_id": "k1", "role": "user", "content": "Kimi远程问题", "thinking_content": None, "msg_time": None},
+            ],
+        },
+    ],
+}
+
+
+def test_remote_pull_imports_and_dedupes(client, monkeypatch):
+    monkeypatch.setattr(bh, "_remote_get", lambda *a, **kw: _REMOTE_DOWNLOAD)
+
+    resp = client.post(
+        "/api/context/browser-history/remote/pull",
+        json={"server_url": "http://192.168.1.5:8321", "token": "srv-token", "device_id": "dev-remote"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["server_total"] == 2
+    assert body["imported"] == 2
+    assert body["failed"] == 0
+
+    # 会话进入本地列表，可查看、可导出（与既有展示/下载链路一致）
+    resp = client.get("/api/context/browser-history/conversations")
+    assert resp.json()["total"] == 2
+    conv_id = resp.json()["conversations"][0]["id"]
+    resp = client.get(f"/api/context/browser-history/conversations/{conv_id}")
+    assert resp.status_code == 200 and resp.json()["messages"]
+
+    # 拉取的数据标记 device_id，并被识别为本机设备
+    db = bh._get_db()
+    with bh._DB_LOCK:
+        rows = db.execute("SELECT DISTINCT device_id FROM conversations").fetchall()
+    assert {r["device_id"] for r in rows} == {"dev-remote"}
+    assert bh._local_device_id() == "dev-remote"
+
+    # 同一数据再次拉取：内容一致 → 全部跳过
+    resp = client.post(
+        "/api/context/browser-history/remote/pull",
+        json={"server_url": "http://192.168.1.5:8321", "token": "srv-token", "device_id": "dev-remote"},
+    )
+    body = resp.json()
+    assert body["imported"] == 0
+    assert body["skipped"] == 2
+
+
+def test_remote_pull_uses_local_device_id_when_absent(client, monkeypatch):
+    """未显式指定 device_id 时自动使用本机最近上传的设备。"""
+    _post_upload(client, "deepseek", _deepseek_single(), device_id="dev-auto")
+
+    seen = {}
+
+    def fake_remote_get(server_url, path, token, params):
+        seen["params"] = params
+        return {"ok": True, "conversations": []}
+
+    monkeypatch.setattr(bh, "_remote_get", fake_remote_get)
+    resp = client.post(
+        "/api/context/browser-history/remote/pull",
+        json={"server_url": "http://srv", "token": "t"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen["params"]["device_id"] == "dev-auto"
+
+
+def test_remote_pull_requires_device_id(client, monkeypatch):
+    resp = client.post(
+        "/api/context/browser-history/remote/pull",
+        json={"server_url": "http://srv", "token": "t"},
+    )
+    assert resp.status_code == 400
+    assert "设备 ID" in resp.json()["detail"]
+
+
+def test_remote_devices_endpoint(client, monkeypatch):
+    def fake_remote_get(server_url, path, token, params):
+        assert path == "/devices"
+        return {"ok": True, "devices": [
+            {"device_id": "dev-a", "conversations": 3, "messages": 10, "last_active": "2026-01-01"},
+        ]}
+
+    monkeypatch.setattr(bh, "_remote_get", fake_remote_get)
+    resp = client.post(
+        "/api/context/browser-history/remote/devices",
+        json={"server_url": "http://srv", "token": "t"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["devices"][0]["device_id"] == "dev-a"
+
+
+def test_remote_get_validates_url_and_token():
+    try:
+        bh._remote_get("ftp://bad", "/download", "t", {})
+        raise AssertionError("应当 400")
+    except Exception as e:
+        assert getattr(e, "status_code", None) == 400
+    try:
+        bh._remote_get("http://srv", "/download", "", {})
+        raise AssertionError("应当 400")
+    except Exception as e:
+        assert getattr(e, "status_code", None) == 400
